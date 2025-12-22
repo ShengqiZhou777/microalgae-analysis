@@ -49,9 +49,6 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
     df = df.sample(frac=1, random_state=42).reset_index(drop=True)
     df['file'] = df['file'].astype(str)
     
-    # if 'cell_mean_area' in df.columns:
-    #     df['cell_mean_area_sq'] = df['cell_mean_area'] ** 2
-    #     df['cell_mean_area_cub'] = df['cell_mean_area'] ** 3
 
     df_hidden = pd.DataFrame()
     if hidden_times:
@@ -61,14 +58,13 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
 
     df['Source_Path'] = df['Source_Path'].astype(str)
     
-    df['Source_Path'] = df['Source_Path'].astype(str)
-    
-    # Define morphological columns 
+    # Define morphological columns (Selected via PCA)
     morph_cols = [
-        'cell_mean_area', 
-        'cell_mean_mean_intensity', 
-        'cell_mean_eccentricity',
-        'cell_mean_solidity'
+        'cell_std_aspect_ratio', 
+        'cell_std_texture_contrast', 
+        'cell_median_texture_energy',
+        'cell_mean_minor_axis',
+        'cell_kurt_major_axis'
     ]
 
     # [HISTORY RESTORED] User wants sliding window history (Prev_ features) but NO calculated kinetic rates.
@@ -191,12 +187,13 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
         # Layer 2: CNN
         pred_cnn_scaled = np.zeros(len(va))
         if mode in ["full", "cnn_only"]:
-            train_ds = MaskedImageDataset(df_train_fold, target_name, IMG_SIZE, train_transform, labels=y_train_scaled)
-            val_ds = MaskedImageDataset(df_val_fold, target_name, IMG_SIZE, val_transform, labels=y_val_scaled)
+            in_channels = 9 if stochastic_window else 3
+            train_ds = MaskedImageDataset(df_train_fold, target_name, IMG_SIZE, train_transform, labels=y_train_scaled, in_channels=in_channels)
+            val_ds = MaskedImageDataset(df_val_fold, target_name, IMG_SIZE, val_transform, labels=y_val_scaled, in_channels=in_channels)
             train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True)
             val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=16, pin_memory=True)
             
-            cnn = ResNetRegressor(BACKBONE).to(DEVICE)
+            cnn = ResNetRegressor(BACKBONE, in_channels=in_channels).to(DEVICE)
             criterion = nn.HuberLoss()
             optimizer = optim.Adam(cnn.parameters(), lr=LR, weight_decay=1e-2)
             

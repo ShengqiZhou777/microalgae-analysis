@@ -19,6 +19,9 @@ def compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=Non
     
     df_aug = df.copy()
     
+    # Include identifier columns to allow Dataset to find historical images
+    id_cols = ['file', 'Source_Path']
+    
     for k in range(1, window_size + 1):
         shift_data = []
         for t in all_times:
@@ -28,7 +31,7 @@ def compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=Non
             prev_idx = idx - k
             prev_t = all_times[prev_idx]
             
-            # Get the pool of features from the previous timepoint
+            # Get the pool of data from the previous timepoint
             prev_pool = df[df['time'] == prev_t].copy()
             
             for cond in ['Light', 'Dark', 'Initial']:
@@ -41,22 +44,28 @@ def compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=Non
                 
                 # Sequential Match: Match by group_idx strictly.
                 if not prev_group.empty:
-                    # Create a mapping for the previous group's features by its idx
-                    prev_feats = prev_group.set_index('group_idx')[morph_cols]
+                    # Also set index for ID columns
+                    prev_feats = prev_group.set_index('group_idx')[morph_cols + id_cols]
                     prev_mean = prev_group[morph_cols].mean().to_dict()
+                    # Fallback for ID columns (not ideal, but handles edge cases)
+                    first_ids = prev_group.iloc[0][id_cols].to_dict()
                     
                     for row_idx, row in curr_group.iterrows():
                         g_idx = row['group_idx']
                         
-                        # Use strict index match if available, else fallback to mean
+                        # Use strict index match if available, else fallback
                         if g_idx in prev_feats.index:
                             stats = prev_feats.loc[g_idx].to_dict()
                         else:
-                            stats = prev_mean
+                            stats = {**prev_mean, **first_ids}
                         
                         aug_row = {'file': row['file'], 'time': t, 'condition': cond}
                         for m_col in morph_cols:
                             aug_row[f'Prev{k}_{m_col}'] = stats[m_col]
+                        # Add historical file paths
+                        for id_col in id_cols:
+                            aug_row[f'Prev{k}_{id_col}'] = stats[id_col]
+                            
                         shift_data.append(aug_row)
         
         df_shift = pd.DataFrame(shift_data)

@@ -67,8 +67,15 @@ def load_moe_ensemble(target, model_prefix):
     # 2. Load Visual Expert (CNN)
     cnn_path = f"{model_prefix}_cnn.pth"
     if os.path.exists(cnn_path):
-        cnn = ResNetRegressor(BACKBONE).to(DEVICE)
+        # Dynamically detect in_channels from the weight file
         state_dict = torch.load(cnn_path, map_location=DEVICE, weights_only=True)
+        # Weight shape for conv1 is [out_channels, in_channels, k, k]
+        actual_in_channels = state_dict['backbone.conv1.weight'].shape[1]
+        
+        artifacts['in_channels'] = actual_in_channels
+        print(f"  [Info] Detected CNN in_channels: {actual_in_channels}")
+        
+        cnn = ResNetRegressor(BACKBONE, in_channels=actual_in_channels).to(DEVICE)
         cnn.load_state_dict(state_dict)
         cnn.eval()
         artifacts['cnn'] = cnn
@@ -148,7 +155,8 @@ def predict_single_target(df, target, artifacts):
         # Let's verify dataset code logic. Assuming it handles None or we pass dummy.
         # We'll pass zeros.
         dummy_labels = np.zeros(len(df))
-        ds = MaskedImageDataset(df, target, IMG_SIZE, transform=val_transform, labels=dummy_labels)
+        in_channels = artifacts.get('in_channels', 3)
+        ds = MaskedImageDataset(df, target, IMG_SIZE, transform=val_transform, labels=dummy_labels, in_channels=in_channels)
         
         # In predict script, maybe we don't have images for all rows?
         # We assume the user provided valid input with images.
@@ -187,18 +195,39 @@ def predict_single_target(df, target, artifacts):
             weights = weights.cpu().numpy()
             
     else:
-        # Fallback to simple average [0.33, 0.33, 0.33]
-        print("  [WARN] Gating Network missing. Using simple average.")
-        weights = np.ones((len(df), 3)) / 3.0
+        # Fallback: Simple Average of AVAILABLE experts
+        print("  [WARN] Gating Network missing. Using simple average of active experts.")
+        weights = np.zeros((len(df), 3))
         
+        # Check which experts are active (artifacts loaded)
+        active_mask = [
+            1 if artifacts.get('xgb2') else 0,
+            1 if artifacts.get('lgb2') else 0,
+            1 if artifacts.get('cnn') else 0
+        ]
+        active_count = sum(active_mask)
+        if active_count > 0:
+            avg_weight = 1.0 / active_count
+            for i in range(3):
+                if active_mask[i]:
+                    weights[:, i] = avg_weight
+        else:
+            # Should not happen if at least one model loaded
+             weights[:, 0] = 1.0 
+
     # --- Aggregate ---
     # Stack experts: [N, 3] -> order MUST match training: XGB, LGB, CNN
     E_preds = np.vstack([preds_map['xgb'], preds_map['lgb'], preds_map['cnn']]).T # [N, 3]
     
     # Weighted Sum
-    # Element-wise multiply and sum across dim 1
-    # weights: [N, 3], E_preds: [N, 3]
     raw_final_pred = np.sum(weights * E_preds, axis=1)
+    
+    # --- [NEW] Return individual expert raw preds for analysis ---
+    expert_raw = {
+        'xgb': preds_map['xgb'],
+        'lgb': preds_map['lgb'], 
+        'cnn': preds_map['cnn']
+    }
     
     # --- Inverse Transform ---
     scaler = artifacts.get('scaler')
@@ -210,7 +239,7 @@ def predict_single_target(df, target, artifacts):
     else:
         final_pred = raw_final_pred
         
-    return final_pred, weights
+    return final_pred, weights, expert_raw
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Target MoE Inference")
@@ -239,7 +268,14 @@ def main():
         
         from algae_fusion.features.sliding_window_stochastic import compute_sliding_window_features_stochastic
         
-        morph_cols = ['cell_mean_area', 'cell_mean_mean_intensity', 'cell_mean_eccentricity', 'cell_mean_solidity']
+        # Updated to match PCA selection used in training
+        morph_cols = [
+            'cell_std_aspect_ratio', 
+            'cell_std_texture_contrast', 
+            'cell_median_texture_energy',
+            'cell_mean_minor_axis',
+            'cell_kurt_major_axis'
+        ]
         print("   [Info] Computing Stochastic Sliding Window...")
         df_combined_aug = compute_sliding_window_features_stochastic(df_combined, window_size=3, morph_cols=morph_cols)
         
@@ -264,12 +300,15 @@ def main():
         try:
             artifacts_static = load_moe_ensemble(target, f"weights/{target}_mean")
             if artifacts_static:
-                pred_static, w_static = predict_single_target(df, target, artifacts_static)
+                pred_static, w_static, exp_static = predict_single_target(df, target, artifacts_static)
                 results[f"Pred_{target}_Static"] = pred_static
-                # Save weights for analysis
                 results[f"W_XGB_{target}_Static"] = w_static[:, 0]
                 results[f"W_LGB_{target}_Static"] = w_static[:, 1]
                 results[f"W_CNN_{target}_Static"] = w_static[:, 2]
+                
+                # Save Individual Experts
+                if exp_static['xgb'] is not None: results[f"Pred_{target}_Static_XGB"] = exp_static['xgb']
+                if exp_static['lgb'] is not None: results[f"Pred_{target}_Static_LGB"] = exp_static['lgb']
             else:
                 print(f"   [WARN] Static model not found for {target}")
         except Exception as e:
@@ -282,72 +321,136 @@ def main():
         try:
             artifacts_dynamic = load_moe_ensemble(target, f"weights/{target}_stochastic")
             if artifacts_dynamic:
-                pred_dynamic, w_dynamic = predict_single_target(df_dynamic, target, artifacts_dynamic)
+                pred_dynamic, w_dynamic, exp_dynamic = predict_single_target(df_dynamic, target, artifacts_dynamic)
                 results[f"Pred_{target}_Dynamic"] = pred_dynamic
                 results[f"W_XGB_{target}_Dynamic"] = w_dynamic[:, 0]
                 results[f"W_LGB_{target}_Dynamic"] = w_dynamic[:, 1]
                 results[f"W_CNN_{target}_Dynamic"] = w_dynamic[:, 2]
+                
+                # Save Individual Experts
+                if exp_dynamic['xgb'] is not None: results[f"Pred_{target}_Dynamic_XGB"] = exp_dynamic['xgb']
+                if exp_dynamic['lgb'] is not None: results[f"Pred_{target}_Dynamic_LGB"] = exp_dynamic['lgb']
             else:
                 print(f"   [WARN] Dynamic model not found for {target}")
         except Exception as e:
             print(f"   [ERROR] Dynamic inference failed: {e}")
 
+    # Calculate R2 if targets exist
+    from sklearn.metrics import r2_score
+    
+    print("\n--------------------------------------")
+    print("       FINAL TEST SET EVALUATION      ")
+    print("--------------------------------------")
+    
+    for target in TARGETS:
+        if target in df.columns:
+            print(f"\n>>> Target: {target} <<<")
+            
+            # Static R2
+            if f"Pred_{target}_Static" in results.columns:
+                r2_static = r2_score(results[target], results[f"Pred_{target}_Static"])
+                print(f"   [Static]  R2 Score: {r2_static:.4f}")
+            
+            # Dynamic R2
+            if f"Pred_{target}_Dynamic" in results.columns:
+                r2_dynamic = r2_score(results[target], results[f"Pred_{target}_Dynamic"])
+                print(f"   [Dynamic] R2 Score: {r2_dynamic:.4f}")
+
     # Save
     out_dir = os.path.dirname(args.output)
-    if out_dir: os.makedirs(out_dir, exist_ok=True)
-    results.to_csv(args.output, index=False)
-    print("\n======================================")
+    # Save Clean Version (Only IDs, Targets, Preds)
+    clean_cols = ['file', 'time', 'condition'] + [t for t in TARGETS if t in results.columns]
+    pred_cols = [c for c in results.columns if c.startswith("Pred_")]
+    results_clean = results[clean_cols + pred_cols].copy()
+    
+    results_clean.to_csv(args.output, index=False)
+    
+    # Also save full version for debugging if needed
+    full_path = args.output.replace(".csv", "_FULL.csv")
+    results.to_csv(full_path, index=False)
+    print(f"      (Full version with weights saved to: {full_path})")
     print(f"Done! MoE results saved to: {args.output}")
     
     # Visualize
     visualize_moe_results(results, TARGETS)
 
 def visualize_moe_results(df, targets):
+    from sklearn.metrics import r2_score
     for target in targets:
         pred_static_col = f"Pred_{target}_Static"
+        pred_dynamic_col = f"Pred_{target}_Dynamic"
         
-        if pred_static_col not in df.columns:
+        has_static = pred_static_col in df.columns
+        has_dynamic = pred_dynamic_col in df.columns
+        has_truth = target in df.columns
+        
+        if not (has_static or has_dynamic):
             continue
             
         plt.figure(figsize=(20, 6))
         
         # 1. Scatter Plot
         plt.subplot(1, 3, 1)
-        if pred_static_col in df.columns:
-            sns.scatterplot(x=df[target], y=df[pred_static_col], alpha=0.5, label='Static')
+        r2_str = ""
+        
+        if has_truth:
+            if has_static:
+                r2_s = r2_score(df[target], df[pred_static_col])
+                sns.scatterplot(x=df[target], y=df[pred_static_col], alpha=0.5, label=f'Static (R2={r2_s:.3f})', color='blue')
+                r2_str += f"S:{r2_s:.2f} "
             
-        lims = [min(plt.xlim()[0], plt.ylim()[0]), max(plt.xlim()[1], plt.ylim()[1])]
-        plt.plot(lims, lims, 'k--', alpha=0.75, zorder=0)
-        plt.title(f"{target}: True vs Pred")
+            if has_dynamic:
+                r2_d = r2_score(df[target], df[pred_dynamic_col])
+                sns.scatterplot(x=df[target], y=df[pred_dynamic_col], alpha=0.5, label=f'Dynamic (R2={r2_d:.3f})', color='red', marker='X')
+                r2_str += f"D:{r2_d:.2f}"
+            
+            lims = [min(plt.xlim()[0], plt.ylim()[0]), max(plt.xlim()[1], plt.ylim()[1])]
+            plt.plot(lims, lims, 'k--', alpha=0.75, zorder=0)
+            plt.title(f"{target}: True vs Pred\n{r2_str}")
+        else:
+            plt.title(f"{target}: Predictions Distribution")
+            if has_static: sns.histplot(df[pred_static_col], color='blue', alpha=0.3, label='Static')
+            if has_dynamic: sns.histplot(df[pred_dynamic_col], color='red', alpha=0.3, label='Dynamic')
         
-        # 2. Expert Weights Distribution (Boxplot)
+        plt.legend()
+        
+        # 2. Expert Weights Distribution (Boxplot) - Use Static for simpler view or Dynamic?
+        # Let's show Dynamic weights if available, else Static
         plt.subplot(1, 3, 2)
-        # Gather weights
-        w_cols = [f"W_XGB_{target}_Static", f"W_LGB_{target}_Static", f"W_CNN_{target}_Static"]
-        w_df = df[w_cols].copy()
-        w_df.columns = ["XGB", "LGB", "CNN"]
-        w_df_melted = w_df.melt(var_name="Expert", value_name="Weight")
+        suffix = "Dynamic" if has_dynamic else "Static"
         
-        sns.boxplot(x="Expert", y="Weight", data=w_df_melted, hue="Expert", legend=False, palette="Set2")
-        plt.title(f"Expert Contribution (MoE Gating)")
-        plt.ylim(0, 1.1)
+        w_cols = [f"W_XGB_{target}_{suffix}", f"W_LGB_{target}_{suffix}", f"W_CNN_{target}_{suffix}"]
+        if all(c in df.columns for c in w_cols):
+            w_df = df[w_cols].copy()
+            w_df.columns = ["XGB", "LGB", "CNN"]
+            w_df_melted = w_df.melt(var_name="Expert", value_name="Weight")
+            
+            sns.boxplot(x="Expert", y="Weight", data=w_df_melted, hue="Expert", legend=False, palette="Set2")
+            plt.title(f"Expert Contribution ({suffix})")
+            plt.ylim(0, 1.1)
         
         # 3. Trajectory
         plt.subplot(1, 3, 3)
-        df_sorted = df.sort_values('time')
-        for cond, style in [('Light', '-'), ('Dark', '--')]:
-            subset = df_sorted[df_sorted['condition'] == cond]
-            if subset.empty: continue
-            
-            true_means = subset.groupby('time')[target].mean()
-            plt.plot(true_means.index, true_means.values, style + 'o', label=f'True {cond}', color='black')
-            
-            if pred_static_col in df.columns:
-                stat_means = subset.groupby('time')[pred_static_col].mean()
-                plt.plot(stat_means.index, stat_means.values, style + 'x', label=f'Static {cond}', color='blue')
+        if 'time' in df.columns and 'condition' in df.columns:
+            df_sorted = df.sort_values('time')
+            for cond, style in [('Light', '-'), ('Dark', '--')]:
+                subset = df_sorted[df_sorted['condition'] == cond]
+                if subset.empty: continue
                 
-        plt.title(f"{target} Dynamics")
-        plt.legend()
+                if has_truth:
+                    true_means = subset.groupby('time')[target].mean()
+                    plt.plot(true_means.index, true_means.values, style + 'o', label=f'True {cond}', color='black')
+                
+                if has_static:
+                    stat_means = subset.groupby('time')[pred_static_col].mean()
+                    plt.plot(stat_means.index, stat_means.values, style + 'x', label=f'Static {cond}', color='blue')
+                
+                if has_dynamic:
+                    dyn_means = subset.groupby('time')[pred_dynamic_col].mean()
+                    plt.plot(dyn_means.index, dyn_means.values, style + '*', label=f'Dynamic {cond}', color='red')
+                    
+            plt.title(f"{target} Population Dynamics")
+            plt.legend()
         
         plt.tight_layout()
         plt.savefig(f"MoE_Result_{target}.png", dpi=300)
