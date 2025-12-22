@@ -9,3 +9,4 @@ __pycache__/
 *.csv
 !training_summary.csv
 .DS_Store
+archive/
