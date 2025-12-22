@@ -1,0 +1,11 @@
+data/
+*.png
+*.tif
+*.jpg
+weights/
+results/
+测试/
+__pycache__/
+*.csv
+!training_summary.csv
+.DS_Store
