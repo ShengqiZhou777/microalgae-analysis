@@ -10,11 +10,11 @@ echo "=================================================="
 for target in "${TARGETS[@]}"; do
     echo ""
     echo ">>> Training Static Model for Target: $target <<<"
-    python3 main.py --target "$target" --mode cnn_only --max_folds 1
+    python3 main.py --target "$target" --mode full --max_folds 1
     
     echo ""
     echo ">>> Training DYNAMIC Model for Target: $target <<<"
-    python3 main.py --target "$target" --mode cnn_only --stochastic --max_folds 1
+    python3 main.py --target "$target" --mode full --stochastic --max_folds 1
     
     if [ $? -eq 0 ]; then
         echo "✅ Successfully trained $target (Static & Dynamic)"

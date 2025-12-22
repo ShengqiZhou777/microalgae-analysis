@@ -24,3 +24,7 @@ Fv_Fm,Dynamic,0.9744
 Oxygen_Rate,Static,0.9583
 Oxygen_Rate,Dynamic,0.9882
 Fv_Fm,Static,0.8789
+Dry_Weight,full,Static,0.9477,output/Dry_Weight/full/Static/predictions_oof.csv
+Dry_Weight,full,Static,0.9758,output/Dry_Weight/full/Static/predictions_oof.csv
+Dry_Weight,full,Dynamic,0.9967,output/Dry_Weight/full/Dynamic/predictions_oof.csv
+Chl_Per_Cell,full,Static,0.9929,output/Chl_Per_Cell/full/Static/predictions_oof.csv

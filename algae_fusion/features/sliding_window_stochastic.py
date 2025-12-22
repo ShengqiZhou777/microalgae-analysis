@@ -23,7 +23,9 @@ def compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=Non
         shift_data = []
         for t in all_times:
             idx = time_idx_map[t]
-            prev_idx = max(0, idx - k)
+            if idx - k < 0:
+                continue # No history available, leave as NaN
+            prev_idx = idx - k
             prev_t = all_times[prev_idx]
             
             # Get the pool of features from the previous timepoint

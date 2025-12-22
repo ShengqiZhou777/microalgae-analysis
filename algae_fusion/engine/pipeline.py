@@ -287,6 +287,13 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
     os.makedirs(output_dir, exist_ok=True)
     
     df[f"Predicted_{target_name}"] = final_pred
+    
+    # [OPTIMIZATION] Save individual experts for One-Shot Ablation Study
+    if mode == "full":
+        df[f"Pred_{target_name}_XGB"] = oof_preds_xgb
+        df[f"Pred_{target_name}_LGB"] = oof_preds_lgb
+        df[f"Pred_{target_name}_CNN"] = oof_preds_cnn
+
     result_csv = os.path.join(output_dir, "predictions_oof.csv")
     df.to_csv(result_csv, index=False)
     
@@ -317,6 +324,9 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
         xgb2.save_model(f"{model_prefix}_xgb2.json")
     if mode in ["full", "lgb_only", "boost_only"]:
         joblib.dump(lgb2, f"{model_prefix}_lgb.joblib")
+    
+    if mode in ["full", "cnn_only"]:
+        torch.save(cnn.state_dict(), f"{model_prefix}_cnn.pth")
     
     # 2. Save Gating Network & Scaler
     torch.save(g_net.state_dict(), f"{model_prefix}_gating.pth")
