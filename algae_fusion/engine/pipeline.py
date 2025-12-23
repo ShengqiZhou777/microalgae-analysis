@@ -298,7 +298,8 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
     print(f"R2 Score: {score:.4f}")
 
     # Append to Summary CSV (Keep global summary too)
-    summary_file = "training_summary.csv"
+    os.makedirs("results", exist_ok=True)
+    summary_file = os.path.join("results", "training_summary.csv")
     if not os.path.exists(summary_file):
         with open(summary_file, "w") as f:
             f.write("Target,Mode,History,R2_Score,Path\n")
