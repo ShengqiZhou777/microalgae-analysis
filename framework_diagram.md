@@ -98,6 +98,9 @@ The model absorbs the morphological noise and maps the entire cluster to a singl
 - **Use harder splits that break the "lookup" shortcut**
   - Leave-one-timepoint-out or leave-one-batch-out folds so the model cannot memorize a specific morphology→label mapping.
   - When possible, create domain-shift validation (e.g., unseen lighting or microscope) to check generalization beyond the current clusters.
+- **If leave-one-timepoint already breaks after ~24h, treat it as a diagnosis**
+  - The sharp drop you observed past 24h implies the model is overfitting early-time morphology. Inspect feature importance and per-timepoint error to confirm which cues fail.
+  - Mitigate by mixing early/late examples in every fold, adding scale/brightness augmentation, and enforcing monotonic or stage-aware constraints so late-time predictions cannot collapse.
 - **Increase label diversity within clusters**
   - If multiple measurements exist per condition/timepoint, keep them separate instead of averaging so the regression task has intra-group variation.
   - Add continuous covariates (e.g., nutrient level, temperature) to the feature table so the model must predict along gradients, not just classify states.
