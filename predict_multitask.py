@@ -387,10 +387,10 @@ def visualize_moe_results(df, targets):
         if not (has_static or has_dynamic):
             continue
             
-        plt.figure(figsize=(20, 6))
+        plt.figure(figsize=(14, 6))
         
         # 1. Scatter Plot
-        plt.subplot(1, 3, 1)
+        plt.subplot(1, 2, 1)
         r2_str = ""
         
         if has_truth:
@@ -414,23 +414,8 @@ def visualize_moe_results(df, targets):
         
         plt.legend()
         
-        # 2. Expert Weights Distribution (Boxplot) - Use Static for simpler view or Dynamic?
-        # Let's show Dynamic weights if available, else Static
-        plt.subplot(1, 3, 2)
-        suffix = "Dynamic" if has_dynamic else "Static"
-        
-        w_cols = [f"W_XGB_{target}_{suffix}", f"W_LGB_{target}_{suffix}", f"W_CNN_{target}_{suffix}"]
-        if all(c in df.columns for c in w_cols):
-            w_df = df[w_cols].copy()
-            w_df.columns = ["XGB", "LGB", "CNN"]
-            w_df_melted = w_df.melt(var_name="Expert", value_name="Weight")
-            
-            sns.boxplot(x="Expert", y="Weight", data=w_df_melted, hue="Expert", legend=False, palette="Set2")
-            plt.title(f"Expert Contribution ({suffix})")
-            plt.ylim(0, 1.1)
-        
-        # 3. Trajectory
-        plt.subplot(1, 3, 3)
+        # 3. Trajectory (Now 2)
+        plt.subplot(1, 2, 2)
         if 'time' in df.columns and 'condition' in df.columns:
             df_sorted = df.sort_values('time')
             for cond, style in [('Light', '-'), ('Dark', '--')]:
