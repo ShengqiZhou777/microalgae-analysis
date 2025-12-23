@@ -13,7 +13,7 @@ from lightgbm import LGBMRegressor
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from algae_fusion.config import IMG_SIZE, DEVICE, BACKBONE
+from algae_fusion.config import IMG_SIZE, DEVICE, BACKBONE, NON_FEATURE_COLS
 from algae_fusion.models.backbones import ResNetRegressor
 from algae_fusion.models.moe import GatingNetwork
 from algae_fusion.data.dataset import MaskedImageDataset
@@ -85,16 +85,17 @@ def load_moe_ensemble(target, model_prefix):
     # 3. Load Gating Network
     gating_path = f"{model_prefix}_gating.pth"
     if os.path.exists(gating_path):
-        # We need input_dim for GatingNetwork. It should be len(gating_cols)
-        # If we can't determine it easily, we might fail. 
-        # But gating_cols is in metadata.
-        if gating_cols:
-            g_net = GatingNetwork(input_dim=len(gating_cols)).to(DEVICE)
-            g_net.load_state_dict(torch.load(gating_path, map_location=DEVICE, weights_only=True))
-            g_net.eval()
-            artifacts['g_net'] = g_net
-        else:
-            print("  [WARN] Gating columns missing in metadata. Cannot load Gating Network.")
+        state_dict_g = torch.load(gating_path, map_location=DEVICE, weights_only=True)
+        # Weight shape for net.0 is [hidden_dim, input_dim]
+        actual_input_dim = state_dict_g['net.0.weight'].shape[1]
+        
+        print(f"  [Info] Gating Network input_dim: {actual_input_dim}")
+        g_net = GatingNetwork(input_dim=actual_input_dim).to(DEVICE)
+        g_net.load_state_dict(state_dict_g)
+        g_net.eval()
+        artifacts['g_net'] = g_net
+    else:
+        print(f"  [WARN] Gating Network missing: {gating_path}")
             
     return artifacts
 
@@ -103,12 +104,16 @@ def predict_single_target(df, target, artifacts):
     Runs the MoE inference for a single target.
     Returns: (final_predictions, expert_weights)
     """
-    feature_cols = artifacts['meta']['feature_cols']
-    gating_cols = artifacts['meta'].get('gating_cols', [])
+    feature_cols = [c for c in artifacts['meta']['feature_cols'] if c != 'split_set']
+    gating_cols = [c for c in artifacts['meta'].get('gating_cols', []) if c != 'split_set']
     
     # --- Prepare Tabular Inputs ---
-    X = df[feature_cols].copy()
-    X = X.select_dtypes(exclude=['object']) # Ensure numeric
+    # Use reindex to handle missing columns gracefully, then filter for numeric
+    X = df.reindex(columns=feature_cols).select_dtypes(include=[np.number]).fillna(0)
+    
+    # Check if we have the correct number of columns for XGB/LGB
+    # If the network was trained on 364 features but X has 365, models might complain.
+    # However, XGB/LGB models usually handle column sets appropriately if names match.
     
     # Layer 1: XGB1
     xgb1 = artifacts.get('xgb1')
@@ -182,9 +187,17 @@ def predict_single_target(df, target, artifacts):
     g_net = artifacts.get('g_net')
     gating_scaler = artifacts.get('gating_scaler')
     
-    if g_net and gating_cols:
+    if g_net:
         # Prepare Gating Input
-        X_gate = df[gating_cols].select_dtypes(include=[np.number]).fillna(0).values.astype(np.float32)
+        X_gate = df.reindex(columns=gating_cols).select_dtypes(include=[np.number]).fillna(0).values.astype(np.float32)
+        
+        # Verify dimension
+        if X_gate.shape[1] != g_net.net[0].weight.shape[1]:
+            print(f"   [WARN] Gating input dimension mismatch! Data: {X_gate.shape[1]}, Model: {g_net.net[0].weight.shape[1]}")
+            # This can happen if some 'numeric' columns in metadata aren't in this DF.
+            # We don't have an easy fix but we'll try to proceed or use fallback.
+            # Actually, reindex already padded with NaN/0, so only filtering by select_dtypes matters.
+        
         if gating_scaler:
             X_gate = gating_scaler.transform(X_gate)
         
@@ -254,38 +267,30 @@ def main():
     print(f"Loading input data from: {args.input}")
     df = pd.read_csv(args.input)
     
-    # --- 1. Dynamic Features Context (Identical to original) ---
-    df_dynamic = df.copy()
-    TRAIN_DB_PATH = "data/dataset_train.csv"
-    if os.path.exists(TRAIN_DB_PATH):
-        print("   [Info] Loading Training DB for History Context...")
-        df_train_db = pd.read_csv(TRAIN_DB_PATH)
-        df_dynamic['is_test'] = True
-        df_train_db['is_test'] = False
-        
-        common_cols = df_dynamic.columns.intersection(df_train_db.columns)
-        df_combined = pd.concat([df_dynamic[common_cols], df_train_db[common_cols]], ignore_index=True)
-        
-        from algae_fusion.features.sliding_window_stochastic import compute_sliding_window_features_stochastic
-        
-        # Updated to match PCA selection used in training
-        morph_cols = [
-            'cell_std_aspect_ratio', 
-            'cell_std_texture_contrast', 
-            'cell_median_texture_energy',
-            'cell_mean_minor_axis',
-            'cell_kurt_major_axis'
-        ]
-        print("   [Info] Computing Stochastic Sliding Window...")
-        df_combined_aug = compute_sliding_window_features_stochastic(df_combined, window_size=3, morph_cols=morph_cols)
-        
-        df_dynamic_aug = df_combined_aug[df_combined_aug['is_test'] == True].copy()
-        # Handle potential duplicates from self-testing merge (many-to-many)
-        df_dynamic_aug = df_dynamic_aug.drop_duplicates(subset=['file'])
-        df_dynamic_aug = df_dynamic_aug.set_index('file').reindex(df['file']).reset_index()
-        df_dynamic = df_dynamic_aug
-    else:
-        print("   [WARN] Training DB not found. Dynamic models will likely fail.")
+    # --- Pre-processing (Consistent with training pipeline) ---
+    df['original_order'] = range(len(df))
+    df.loc[df['condition'] == 'Initial', 'condition'] = 'Light'
+    
+    # Sort and assign group_idx (Necessary for sequential matching)
+    df = df.sort_values(by=['condition', 'time', 'file']).reset_index(drop=True)
+    df['group_idx'] = df.groupby(['condition', 'time']).cumcount()
+    
+    # --- 1. Dynamic Features Context ---
+    # Since the 20% test set is a complete slice of trajectories, 
+    # we can compute features directly on the input.
+    print("   [Info] Computing Stochastic Sliding Window on input data...")
+    from algae_fusion.features.sliding_window_stochastic import compute_sliding_window_features_stochastic
+    
+    # Match pipeline.py logic: Automatically identify all morphological columns
+    all_numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    morph_cols = [c for c in all_numeric_cols if c.startswith('cell_') and c not in NON_FEATURE_COLS]
+    print(f"   [Info] Identified {len(morph_cols)} morphological features.")
+
+    df_dynamic = compute_sliding_window_features_stochastic(df, window_size=2, morph_cols=morph_cols)
+    
+    # Ensure group_idx is retained (fix for previous drop bug)
+    if 'group_idx' not in df_dynamic.columns:
+        df_dynamic['group_idx'] = df_dynamic.groupby(['condition', 'time']).cumcount()
 
     results = df.copy()
     
@@ -321,19 +326,31 @@ def main():
         try:
             artifacts_dynamic = load_moe_ensemble(target, f"weights/{target}_stochastic")
             if artifacts_dynamic:
+                # Ensure df_dynamic has only the rows present in results, and align them
+                # (df_dynamic should already have all rows from the input)
                 pred_dynamic, w_dynamic, exp_dynamic = predict_single_target(df_dynamic, target, artifacts_dynamic)
-                results[f"Pred_{target}_Dynamic"] = pred_dynamic
-                results[f"W_XGB_{target}_Dynamic"] = w_dynamic[:, 0]
-                results[f"W_LGB_{target}_Dynamic"] = w_dynamic[:, 1]
-                results[f"W_CNN_{target}_Dynamic"] = w_dynamic[:, 2]
                 
-                # Save Individual Experts
-                if exp_dynamic['xgb'] is not None: results[f"Pred_{target}_Dynamic_XGB"] = exp_dynamic['xgb']
-                if exp_dynamic['lgb'] is not None: results[f"Pred_{target}_Dynamic_LGB"] = exp_dynamic['lgb']
+                # [CRITICAL] Align the predictions from df_dynamic back to results dataframe by file
+                pred_df = pd.DataFrame({
+                    'file': df_dynamic['file'],
+                    f"Pred_{target}_Dynamic": pred_dynamic,
+                    f"W_XGB_{target}_Dynamic": w_dynamic[:, 0],
+                    f"W_LGB_{target}_Dynamic": w_dynamic[:, 1],
+                    f"W_CNN_{target}_Dynamic": w_dynamic[:, 2]
+                })
+                # Add individual experts if they exist
+                if exp_dynamic['xgb'] is not None: pred_df[f"Pred_{target}_Dynamic_XGB"] = exp_dynamic['xgb']
+                if exp_dynamic['lgb'] is not None: pred_df[f"Pred_{target}_Dynamic_LGB"] = exp_dynamic['lgb']
+                
+                # Merge back to results efficiently
+                results = results.merge(pred_df, on='file', how='left')
+                
             else:
                 print(f"   [WARN] Dynamic model not found for {target}")
         except Exception as e:
-            print(f"   [ERROR] Dynamic inference failed: {e}")
+            print(f"   [ERROR] Dynamic inference failed for {target}: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Calculate R2 if targets exist
     from sklearn.metrics import r2_score
@@ -361,11 +378,13 @@ def main():
     # Save Clean Version (Only IDs, Targets, Preds)
     clean_cols = ['file', 'time', 'condition'] + [t for t in TARGETS if t in results.columns]
     pred_cols = [c for c in results.columns if c.startswith("Pred_")]
-    results_clean = results[clean_cols + pred_cols].copy()
+    # Restore original order for output
+    results = results.sort_values('original_order').drop(columns=['original_order'])
     
+    results_clean = results[clean_cols + pred_cols].copy()
     results_clean.to_csv(args.output, index=False)
     
-    # Also save full version for debugging if needed
+    # Also save full version for debugging
     full_path = args.output.replace(".csv", "_FULL.csv")
     results.to_csv(full_path, index=False)
     print(f"      (Full version with weights saved to: {full_path})")

@@ -42,12 +42,35 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
     print(f"STARTING PIPELINE: Target={target_name}, Mode={mode}, CV={cv_method} ({status})")
     print(f"{'='*40}\n")
 
-    df = pd.read_csv("data/dataset_train.csv")
-
+    # --- [DETERMINISTIC DATA POOLING] ---
+    train_df = pd.read_csv("data/dataset_train.csv")
+    test_df = pd.read_csv("data/dataset_test.csv") if os.path.exists("data/dataset_test.csv") else pd.DataFrame()
     
+    df = pd.concat([train_df, test_df], ignore_index=True)
     df.loc[df['condition'] == 'Initial', 'condition'] = 'Light'
-    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
-    df['file'] = df['file'].astype(str)
+    
+    # 1. Sort by condition/time/file for stable group_idx
+    df = df.sort_values(by=['condition', 'time', 'file']).reset_index(drop=True)
+    df['group_idx'] = df.groupby(['condition', 'time']).cumcount()
+    
+    # 2. Assign deterministic split based on threshold (80/20)
+    # We apply the split per (condition, time) group or globally? 
+    # Senior said "first 80% for train/val, last 20% for prediction".
+    # Applying per group ensures 80/20 balance at every timepoint.
+    def assign_split(group):
+        N = len(group)
+        test_thresh = int(N * 0.8)
+        val_thresh = int(test_thresh * 0.8)
+        
+        splits = ['TRAIN'] * N
+        for i in range(val_thresh, test_thresh):
+            splits[i] = 'VAL'
+        for i in range(test_thresh, N):
+            splits[i] = 'TEST'
+        group['split_set'] = splits
+        return group
+
+    df = df.groupby(['condition', 'time'], group_keys=False).apply(assign_split)
     
 
     df_hidden = pd.DataFrame()
@@ -58,14 +81,11 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
 
     df['Source_Path'] = df['Source_Path'].astype(str)
     
-    # Define morphological columns (Selected via PCA)
-    morph_cols = [
-        'cell_std_aspect_ratio', 
-        'cell_std_texture_contrast', 
-        'cell_median_texture_energy',
-        'cell_mean_minor_axis',
-        'cell_kurt_major_axis'
-    ]
+    # --- [DYNAMIC FEATURE SELECTION] ---
+    # Automatically identify all morphological columns (starting with cell_)
+    all_numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    morph_cols = [c for c in all_numeric_cols if c.startswith('cell_') and c not in NON_FEATURE_COLS]
+    print(f"  [Info] Identified {len(morph_cols)} morphological features.")
 
     # [HISTORY RESTORED] User wants sliding window history (Prev_ features) but NO calculated kinetic rates.
     # We use stochastic window to get these history raw features.
@@ -73,7 +93,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
     if stochastic_window:
         print("  [Feature Engineering] Computing Sliding Window History (Prev_ features)...")
         # We use stochastic window (better for individual trajectories in this dataset context)
-        df = compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=morph_cols)
+        df = compute_sliding_window_features_stochastic(df, window_size=2, morph_cols=morph_cols)
     else:
         print("  [Static Mode] No History/Sliding Window features computed.")
     
@@ -108,20 +128,32 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
         hidden_accum_cnn = np.zeros(len(df_hidden))
         folds_run = 0
     
-    groups = df['file']
-    if cv_method == "loocv":
-        splitter = LeaveOneOut().split(df)
-    elif cv_method == "group":
-        if max_folds == 1:
-            splitter = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=42).split(df, groups=groups)
-        # else: # Fallback to standard GroupKFold logic which works better with groups passed to split
-            # splitter = GroupKFold(n_splits=N_SPLITS).split(df, groups=groups)
-        else:
-             # Standard GroupKFold
-             splitter = GroupKFold(n_splits=N_SPLITS).split(df, groups=groups)
+    # --- [DETERMINISTIC SPLITTER] ---
+    train_pool_mask = df['split_set'].isin(['TRAIN', 'VAL'])
+    df_pool = df[train_pool_mask].reset_index(drop=True)
+    
+    # Save the held-out TEST set for later if needed (though inference uses separate script)
+    df_test_final = df[df['split_set'] == 'TEST'].reset_index(drop=True)
+    
+    # In deterministic mode, we only have ONE fold for max_folds=1
+    if cv_method == "group" and max_folds == 1:
+        # One-shot split based on the stable assignment
+        tr_indices = df_pool.index[df_pool['split_set'] == 'TRAIN'].tolist()
+        va_indices = df_pool.index[df_pool['split_set'] == 'VAL'].tolist()
+        splitter = [(tr_indices, va_indices)]
     else:
-        splitter = KFold(n_splits=N_SPLITS, shuffle=True, random_state=42).split(df)
+        # Fallback for other CV modes or multi-fold
+        groups = df_pool['group_idx']
+        if cv_method == "loocv":
+            splitter = LeaveOneOut().split(df_pool)
+        elif cv_method == "group":
+            splitter = GroupKFold(n_splits=N_SPLITS).split(df_pool, groups=groups)
+        else:
+            splitter = KFold(n_splits=N_SPLITS, shuffle=True, random_state=42).split(df_pool)
 
+    # Use df_pool for the rest of the training pipeline
+    df = df_pool
+    
     processed_indices = []
     feature_names = None
 
@@ -337,8 +369,8 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
     # 4. Save Metadata (Features used)
     metadata = {
         'target_name': target_name,
-        'feature_cols': tab_cols,
-        'gating_cols': gating_cols,
+        'feature_cols': [c for c in X_tab_train.columns.tolist() if c not in ['split_set']],
+        'gating_cols': [c for c in gating_cols if c not in ['split_set']],
         'stochastic': stochastic_window,
         'mode': mode
     }

@@ -72,4 +72,4 @@ def compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=Non
         if not df_shift.empty:
             df_aug = df_aug.merge(df_shift, on=['file', 'time', 'condition'], how='left')
             
-    return df_aug.drop(columns=['group_idx'])
+    return df_aug

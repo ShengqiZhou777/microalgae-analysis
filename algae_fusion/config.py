@@ -8,7 +8,7 @@ PATH_PREFIX = "data/"
 # ================= 训练参数 =================
 IMG_SIZE = (512, 512) 
 BATCH_SIZE = 64     
-EPOCHS = 15
+EPOCHS = 5
 LR = 1e-5                    
 
 # ================= 验证策略 =================
@@ -25,6 +25,6 @@ NON_FEATURE_COLS = [
     'file', 'Source_Path', 'time', 'condition', 
     'Dry_Weight', 'Chl_Per_Cell', 'Fv_Fm', 'Oxygen_Rate', 'Total_Chl',
     'condition_encoded', 'time_x_cond', 'time_squared', 'time_log',
-    'Prev_Time', 'dt', 'group_id',
+    'Prev_Time', 'dt', 'group_id', 'group_idx', 'split_set',
     'Prev1_file', 'Prev1_Source_Path', 'Prev2_file', 'Prev2_Source_Path', 'Prev3_file', 'Prev3_Source_Path'
 ]
