@@ -1,4 +1,6 @@
 import argparse
+import sys
+import os
 from algae_fusion.engine.pipeline import run_pipeline, run_loo_experiment
 
 if __name__ == "__main__":
@@ -13,6 +15,12 @@ if __name__ == "__main__":
     parser.add_argument("--condition", type=str, default="All", choices=["All", "Light", "Dark"], help="Filter by condition")
 
     args = parser.parse_args()
+    
+    # [LOGGING SETUP]
+    # We set up logging based on args
+    sys.path.append(os.path.dirname(os.path.abspath(__file__))) # Ensure local imports work
+    from algae_fusion.utils.logger import setup_logger
+    setup_logger(args.target, args.condition)
 
     if args.loo:
         run_loo_experiment(target_name=args.target, stochastic_window=args.stochastic)

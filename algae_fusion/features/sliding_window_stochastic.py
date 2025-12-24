@@ -27,20 +27,27 @@ def compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=Non
         for t in all_times:
             idx = time_idx_map[t]
             idx = time_idx_map[t]
-            # Moved check down to allow for custom prev_idx mapping
-            # [USER REQUEST] Special Window Logic for 1h (Image Index 1)
-            # User wants: 1h -> Prev1=Self, Prev2=0h (Shifted window)
-            if idx == 1:
-                if k == 1:
-                    prev_idx = idx      # Prev1 uses Self
-                elif k == 2:
-                    prev_idx = idx - 1  # Prev2 uses 0h
-                else:
-                    prev_idx = idx - k  # Fallback for k>2
+            # [USER REQUEST] Special Window Logic
+            # 1h (Idx 1) -> Prev1=1h, Prev2=1h, Prev3=0h
+            # 2h (Idx 2) -> Prev1=2h, Prev2=1h, Prev3=0h
+            if idx == 1: # 1h
+                if k == 1: prev_idx = 1     # Self
+                elif k == 2: prev_idx = 1   # Self
+                elif k == 3: prev_idx = 0   # 0h
+                else: prev_idx = idx - k
+            elif idx == 2: # 2h
+                if k == 1: prev_idx = 2     # Self
+                elif k == 2: prev_idx = 1   # 1h
+                elif k == 3: prev_idx = 0   # 0h
+                else: prev_idx = idx - k
+                
             else:
                 prev_idx = idx - k
 
+            # Additional check to ensure we don't access negative indices for other cases
             if prev_idx < 0:
+                # If we still go below 0 (e.g. at 24h doing Prev10), we just skip
+                continue
                 continue # No history available, leave as NaN (handled by fillna later)
                 
             prev_t = all_times[prev_idx]

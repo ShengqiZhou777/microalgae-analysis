@@ -16,9 +16,9 @@ for condition in "${CONDITIONS[@]}"; do
 
     for target in "${TARGETS[@]}"; do
         echo ""
-      # 1. Static Model (No --stochastic)
-    echo " -> Training Static Model for $target ($condition)..."
-    python3 main.py --target "$target" --mode full --condition "$condition"
+    # # 1. Static Model (No --stochastic)
+    # echo " -> Training Static Model for $target ($condition)..."
+    # python3 main.py --target "$target" --mode full --condition "$condition"
     
     # 2. Dynamic Model (With --stochastic)
     echo " -> Training Dynamic Model for $target ($condition)..."

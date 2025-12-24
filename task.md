@@ -1,0 +1,8 @@
+- [ ] Analyze Prediction Input Requirements <!-- id: 0 -->
+- [x] Generate Initial Performance Report <!-- id: 1 -->
+- [x] Verify Feature Effectiveness (XGBoost & CNN) <!-- id: 2 -->
+- [x] Finalize Report with Importance Analysis <!-- id: 3 -->
+- [ ] Implement 3-Window History (Prev3) <!-- id: 4 -->
+    - [ ] Update dataset.py to support 12 channels <!-- id: 5 -->
+    - [ ] Update pipeline.py feature generation <!-- id: 6 -->
+    - [ ] Verify functionality <!-- id: 7 -->

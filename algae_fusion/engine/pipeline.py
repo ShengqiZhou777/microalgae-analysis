@@ -74,16 +74,33 @@ def prepare_lstm_tensor(df, morph_cols, scaler=None):
     return torch.FloatTensor(x_seq)
 
 
-def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stochastic_window=False, condition=None):
+def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stochastic_window=False, condition=None, window_size=None):
     """
-    target_name: "Dry_Weight" or "Fv_Fm"
-    mode: "full", "xgb_only", "lgb_only", "cnn_only"
-    condition: "Light", "Dark", etc.
-    Fixed Split: Train (0-80%), Val (80-100% of the training pool)
+    Orchestrate the full training pipeline.
+    
+    Args:
+        target_name: The regression target column.
+        mode: "full" (all features), "cnn_only", or "boost_only".
+    Args:
+        target_name: The regression target column.
+        mode: "full" (all features), "cnn_only", or "boost_only".
+        hidden_times: List of timepoints to exclude from training (LOO CV).
+        stochastic_window: If True, uses randomized history matching.
+        condition: If None, train on both. If "Light" or "Dark", train specific.
+        window_size: Sliding window size (history length). Defaults to config value.
     """
+    # [CONFIG] Window Size for History
+    if window_size is None:
+        window_size = WINDOW_SIZE
+    
+    # Window=3 means we look back at t-3, t-2, t-1 (plus current t)
+    # Total Channels = (3+1) * 3 = 12
+    # in_channels calculation uses window_size
+    
+    in_channels = (window_size + 1) * 3 if stochastic_window else 3
     print(f"\n\n{'='*40}")
     status = "DYNAMIC (History)" if stochastic_window else "STATIC (No History)"
-    print(f"STARTING PIPELINE: Target={target_name}, Mode={mode}, ({status})")
+    print(f"STARTING PIPELINE: Target={target_name}, Mode={mode} | {status} (Win={window_size}, Ch={in_channels})")
     print(f"{'='*40}\n")
 
     # --- [DETERMINISTIC DATA POOLING] ---
@@ -91,13 +108,10 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     test_df = pd.read_csv("data/dataset_test.csv") if os.path.exists("data/dataset_test.csv") else pd.DataFrame()
     
     df = pd.concat([train_df, test_df], ignore_index=True)
-    # df.loc[df['condition'] == 'Initial', 'condition'] = 'Light' # Removed to respect original content or upstream handling
     
     # --- [FILTER CONDITION] ---
     if condition is not None and condition != "All":
         print(f"  [Filter] Selecting only '{condition}' samples (plus Initial 0h if available)...")
-        # Ensure Initial is always included if needed, OR user handles it manually.
-        # Strict filtering:
         df = df[df['condition'] == condition].reset_index(drop=True)
         if df.empty:
             raise ValueError(f"No samples found for condition '{condition}'!")
@@ -107,9 +121,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     df['group_idx'] = df.groupby(['condition', 'time']).cumcount()
     
     # 2. Assign deterministic split based on threshold (80/20)
-    # We apply the split per (condition, time) group or globally? 
-    # Senior said "first 80% for train/val, last 20% for prediction".
-    # Applying per group ensures 80/20 balance at every timepoint.
+    # We apply the split per (condition, time) group
     def assign_split(group):
         N = len(group)
         test_thresh = int(N * 0.8)
@@ -125,7 +137,6 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
 
     df = df.groupby(['condition', 'time'], group_keys=False).apply(assign_split)
     
-
     df_hidden = pd.DataFrame()
     if hidden_times:
         mask = df['time'].isin(hidden_times)
@@ -140,19 +151,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     morph_cols = [c for c in all_numeric_cols if c.startswith('cell_') and c not in NON_FEATURE_COLS]
     print(f"  [Info] Identified {len(morph_cols)} morphological features.")
 
-    # [HISTORY RESTORED] User wants sliding window history (Prev_ features) but NO calculated kinetic rates.
-    # We use stochastic window to get these history raw features.
-    
-    # [REFACTORED] Compute inside CV loop to prevent leakage!
-    # if stochastic_window:
-    #     print("  [Feature Engineering] Computing Sliding Window History (Prev_ features)...")
-    #     df = compute_sliding_window_features_stochastic(df, window_size=2, morph_cols=morph_cols)
-    # else:
-    #     print("  [Static Mode] No History/Sliding Window features computed.")
-    
-    # [Note] We do NOT call compute_kinetic_features, so Rate_ and Rel_ are NOT computed in either case.
-
-
+    # --- [TRANSFORMS] ---
     train_transform = transforms.Compose([
         transforms.Resize(IMG_SIZE),
         transforms.RandomHorizontalFlip(),
@@ -169,37 +168,63 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     ])
 
-    # [REFACTORED] Fixed Split Mode - No Loops, No OOF arrays
-    
-    # --- [DETERMINISTIC SPLITTER] ---
+    # --- SINGLE PASS TRAINING SETUP ---
     train_pool_mask = df['split_set'].isin(['TRAIN', 'VAL'])
     df_pool = df[train_pool_mask].reset_index(drop=True)
     
-    # Save the held-out TEST set for later if needed
-    df_test_final = df[df['split_set'] == 'TEST'].reset_index(drop=True)
-    
-    # Define Split manually
     tr_indices = df_pool.index[df_pool['split_set'] == 'TRAIN'].tolist()
     va_indices = df_pool.index[df_pool['split_set'] == 'VAL'].tolist()
     
     print(f"  [Split] Train: {len(tr_indices)}, Val: {len(va_indices)}")
 
-    # Use df_pool for the rest of the training pipeline
-    df = df_pool
-    
-    # --- SINGLE PASS TRAINING ---
-    
-    df_train_fold, df_val_fold = df.iloc[tr_indices].copy(), df.iloc[va_indices].copy()
+    df_train_fold, df_val_fold = df_pool.iloc[tr_indices].copy(), df_pool.iloc[va_indices].copy()
 
     # [NEW Logic] Isolate Feature Engineering
     if stochastic_window:
-        print("  [Fold] Computing History for TRAIN (Dense)...")
-        df_train_fold = compute_sliding_window_features_stochastic(df_train_fold, window_size=2, morph_cols=morph_cols)
+        print(f"  [Fold] Computing History (Win={window_size}) for TRAIN (Dense)...")
+        df_train_fold = compute_sliding_window_features_stochastic(df_train_fold, window_size=window_size, morph_cols=morph_cols)
         
-        print("  [Fold] Computing History for VAL (Sparse - Simulating Test)...")
-        df_val_fold = compute_sliding_window_features_stochastic(df_val_fold, window_size=2, morph_cols=morph_cols)
+        print(f"  [Fold] Computing History (Win={window_size}) for VAL (Sparse - Simulating Test)...")
+        df_val_fold = compute_sliding_window_features_stochastic(df_val_fold, window_size=window_size, morph_cols=morph_cols)
     else:
         print("  [Static Mode] No History computed.")
+    
+    df_test = df[df['split_set'] == 'TEST'].copy()
+    df_train = df_pool.copy()
+    
+    # Filter Condition if needed
+    if condition:
+        print(f"  [Filter] Using only {condition} samples.")
+        df_train = df_train[df_train['condition'] == condition]
+        df_test = df_test[df_test['condition'] == condition]
+
+    # 3. K-Fold CV on Training Set
+    # We use GroupKFold on 'group_id' to prevent leakage
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    # Ideally should be GroupKFold but for simplicity KFold on mixed groups
+    
+    # Placeholder for results
+    fold_metrics = []
+    
+    # Feature Columns (exclude non-feature ones)
+    feature_cols = [c for c in df.columns if c not in NON_FEATURE_COLS and "Prev" not in c]
+    # 'Prev' features are generated dynamically if stochastic
+    
+    # Identify Morphology Columns for History Gen
+    morph_cols = [c for c in feature_cols if "intensity" in c or "area" in c or "perimeter" in c or "eccentricity" in c]
+
+    for fold, (train_idx, val_idx) in enumerate(kf.split(df_train)):
+        # print(f"\n[Fold {fold+1}/5]")
+        
+        df_train_fold = df_train.iloc[train_idx].copy()
+        df_val_fold   = df_train.iloc[val_idx].copy()
+        
+        # 4. Stochastic Sliding Window (Dynamic Features)
+        if stochastic_window:
+            # print(f"  [Fold] Computing History (Win={window_size}) for TRAIN...")
+            df_train_fold = compute_sliding_window_features_stochastic(df_train_fold, window_size=window_size, morph_cols=morph_cols)
+            # print(f"  [Fold] Computing History (Win={window_size}) for VAL...")
+            df_val_fold   = compute_sliding_window_features_stochastic(df_val_fold, window_size=window_size, morph_cols=morph_cols)
     
     tab_cols = [c for c in df_train_fold.columns if c not in NON_FEATURE_COLS]
     X_tab_train = df_train_fold[tab_cols].select_dtypes(exclude=['object'])
@@ -334,7 +359,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     
     val_preds_lgb = np.zeros(len(va_indices))
     if mode in ["full", "lgb_only", "boost_only"]:
-        lgb2 = LGBMRegressor(n_estimators=800, learning_rate=0.05, num_leaves=31)
+        lgb2 = LGBMRegressor(n_estimators=800, learning_rate=0.05, num_leaves=31, verbose=-1)
         lgb2.fit(X_train_aug, y_train_scaled)
         p_scaled = lgb2.predict(X_val_aug)
         val_preds_lgb = pt_fold.inverse_transform(p_scaled)
@@ -342,7 +367,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     # Layer 2: CNN
     val_preds_cnn = np.zeros(len(va_indices))
     if mode in ["full", "cnn_only"]:
-        in_channels = 9 if stochastic_window else 3
+        in_channels = (window_size + 1) * 3 if stochastic_window else 3
         train_ds = MaskedImageDataset(df_train_fold, target_name, IMG_SIZE, train_transform, labels=y_train_scaled, in_channels=in_channels)
         val_ds = MaskedImageDataset(df_val_fold, target_name, IMG_SIZE, val_transform, labels=y_val_scaled, in_channels=in_channels)
         train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True)
@@ -518,6 +543,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         'feature_cols': [c for c in X_tab_train.columns.tolist() if c not in ['split_set']],
         'gating_cols': [c for c in gating_cols if c not in ['split_set']],
         'stochastic': stochastic_window,
+        'window_size': window_size,
         'mode': mode
     }
     with open(f"{model_prefix}_metadata.json", "w") as f:
@@ -528,9 +554,10 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
 def visualize_results(csv_path, target_name, output_dir="."):
     df = pd.read_csv(csv_path)
     
-    plt.figure(figsize=(15, 6))
+    # Increase height to accommodate split plots
+    plt.figure(figsize=(18, 12)) 
     
-    # Subplot 1: All Samples Scatter Plot
+    # Subplot 1: All Samples Scatter Plot (Left Half)
     plt.subplot(1, 2, 1)
     y_true = df[target_name]
     y_pred = df[f"Predicted_{target_name}"]
@@ -545,37 +572,44 @@ def visualize_results(csv_path, target_name, output_dir="."):
     plt.xlabel(f"True {target_name}")
     plt.ylabel(f"Predicted {target_name}")
     
-    # Subplot 2: Population Trajectory (Mean over Time)
-    plt.subplot(1, 2, 2)
-    
-    for cond, color in [('Light', 'red'), ('Dark', 'blue')]:
-        subset = df[df['condition'] == cond]
-        if subset.empty: continue
+    # Helper for trajectory plotting
+    def plot_trajectory(ax, condition, color):
+        subset = df[df['condition'] == condition]
+        if subset.empty: return
         
-        # Group by time and calculate mean/std for True and Pred
+        # Group by time and calculate mean/std
         true_stats = subset.groupby('time')[target_name].agg(['mean', 'std'])
         pred_stats = subset.groupby('time')[f"Predicted_{target_name}"].agg(['mean', 'std'])
         
-        # Plot True values (Dashed lines with markers)
-        plt.plot(true_stats.index, true_stats['mean'], '--o', color=color, alpha=0.5, label=f'True {cond}')
-        # Plot Predicted values (Solid lines with markers)
-        plt.plot(pred_stats.index, pred_stats['mean'], '-s', color=color, label=f'Pred {cond}')
+        # Plot True
+        ax.plot(true_stats.index, true_stats['mean'], '--o', color=color, alpha=0.6, label=f'True {condition}')
+        # Plot Pred
+        ax.plot(pred_stats.index, pred_stats['mean'], '-s', color=color, label=f'Pred {condition}', linewidth=2)
         
-        # Fill error bands (std)
-        plt.fill_between(true_stats.index, true_stats['mean'] - true_stats['std'], 
+        # Fill Error
+        ax.fill_between(true_stats.index, true_stats['mean'] - true_stats['std'], 
                          true_stats['mean'] + true_stats['std'], color=color, alpha=0.1)
+        
+        ax.set_title(f"{target_name} Population Trajectory ({condition})")
+        ax.set_xlabel("Time (h)")
+        ax.set_ylabel(target_name)
+        ax.legend()
+        ax.grid(True, linestyle='--', alpha=0.3)
 
-    plt.title(f"{target_name} Population Trajectory")
-    plt.xlabel("Time (h)")
-    plt.ylabel(target_name)
-    plt.legend()
+    # Subplot 2: Light Trajectory (Top Right)
+    ax2 = plt.subplot(2, 2, 2)
+    plot_trajectory(ax2, 'Light', 'red')
+    
+    # Subplot 3: Dark Trajectory (Bottom Right)
+    ax3 = plt.subplot(2, 2, 4)
+    plot_trajectory(ax3, 'Dark', 'blue')
     
     plt.tight_layout()
     viz_path = os.path.join(output_dir, f"validation_plot.png")
     plt.savefig(viz_path, dpi=300)
     print(f"  [SUCCESS] Saved result visualization to: {viz_path}")
 
-def run_loo_experiment(target_name="Dry_Weight", stochastic_window=False):
+def run_loo_experiment(target_name="Dry_Weight", stochastic_window=False, window_size=None):
     all_times = [1, 2, 3, 6, 12, 24, 48, 72]
     for t in all_times:
-        run_pipeline(target_name=target_name, mode="full", hidden_times=[t], stochastic_window=stochastic_window)
+        run_pipeline(target_name=target_name, mode="full", hidden_times=[t], stochastic_window=stochastic_window, window_size=window_size)

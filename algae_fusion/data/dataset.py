@@ -51,12 +51,18 @@ class MaskedImageDataset(Dataset):
         row = self.df.iloc[idx]
         
         all_tensors = []
-        if self.in_channels == 9:
-            # Determine how many history frames to look for
-            # Sequence: [t-2, t-1, t] -> Total 9 channels
-            history_keys = [f"Prev{k}_file" for k in [2, 1]] 
+        all_tensors = []
+        # Dynamic History Logic
+        # Total Channels = (History + Current) * 3
+        # History Frames = (In_Channels / 3) - 1
+        # Example: 12 channels -> (12/3) - 1 = 3 history frames (Prev3, Prev2, Prev1)
+        if self.in_channels > 3:
+            num_history = (self.in_channels // 3) - 1
+            # Sequence: [t-N, ..., t-2, t-1, t]
+            # We iterate backwards from N down to 1
+            history_keys = [f"Prev{k}_file" for k in range(num_history, 0, -1)]
             
-            # 1. Load History (t-2 then t-1)
+            # 1. Load History
             for key in history_keys:
                 if key in row and pd.notna(row[key]):
                     # Load historical frame

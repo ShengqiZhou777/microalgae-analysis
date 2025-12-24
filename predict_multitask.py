@@ -13,7 +13,7 @@ from lightgbm import LGBMRegressor
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from algae_fusion.config import IMG_SIZE, DEVICE, BACKBONE, NON_FEATURE_COLS
+from algae_fusion.config import IMG_SIZE, DEVICE, BACKBONE, NON_FEATURE_COLS, WINDOW_SIZE
 from algae_fusion.models.backbones import ResNetRegressor
 from algae_fusion.models.moe import GatingNetwork
 from algae_fusion.models.moe import GatingNetwork
@@ -346,7 +346,7 @@ def main():
     morph_cols = [c for c in all_numeric_cols if c.startswith('cell_') and c not in NON_FEATURE_COLS]
     print(f"   [Info] Identified {len(morph_cols)} morphological features.")
 
-    df_dynamic = compute_sliding_window_features_stochastic(df, window_size=2, morph_cols=morph_cols)
+    df_dynamic = compute_sliding_window_features_stochastic(df, window_size=WINDOW_SIZE, morph_cols=morph_cols)
     
     # Ensure group_idx is retained (fix for previous drop bug)
     if 'group_idx' not in df_dynamic.columns:
@@ -513,9 +513,10 @@ def visualize_moe_results(df, targets):
         if not (has_static or has_dynamic):
             continue
             
-        plt.figure(figsize=(14, 6))
+        # Refactored Layout: (18, 12) size, split Scatter (Left) and Trajectories (Right Top/Bottom)
+        plt.figure(figsize=(18, 12))
         
-        # 1. Scatter Plot
+        # 1. Scatter Plot (Left Half)
         plt.subplot(1, 2, 1)
         r2_str = ""
         
@@ -533,6 +534,8 @@ def visualize_moe_results(df, targets):
             lims = [min(plt.xlim()[0], plt.ylim()[0]), max(plt.xlim()[1], plt.ylim()[1])]
             plt.plot(lims, lims, 'k--', alpha=0.75, zorder=0)
             plt.title(f"{target}: True vs Pred\n{r2_str}")
+            plt.xlabel(f"True {target}")
+            plt.ylabel(f"Predicted {target}")
         else:
             plt.title(f"{target}: Predictions Distribution")
             if has_static: sns.histplot(df[pred_static_col], color='blue', alpha=0.3, label='Static')
@@ -540,28 +543,40 @@ def visualize_moe_results(df, targets):
         
         plt.legend()
         
-        # 3. Trajectory (Now 2)
-        plt.subplot(1, 2, 2)
-        if 'time' in df.columns and 'condition' in df.columns:
+        # Helper for trajectory
+        def plot_traj(ax, cond):
+            if 'time' not in df.columns or 'condition' not in df.columns: return
+            
             df_sorted = df.sort_values('time')
-            for cond, style in [('Light', '-'), ('Dark', '--')]:
-                subset = df_sorted[df_sorted['condition'] == cond]
-                if subset.empty: continue
-                
-                if has_truth:
-                    true_means = subset.groupby('time')[target].mean()
-                    plt.plot(true_means.index, true_means.values, style + 'o', label=f'True {cond}', color='black')
-                
-                if has_static:
-                    stat_means = subset.groupby('time')[pred_static_col].mean()
-                    plt.plot(stat_means.index, stat_means.values, style + 'x', label=f'Static {cond}', color='blue')
-                
-                if has_dynamic:
-                    dyn_means = subset.groupby('time')[pred_dynamic_col].mean()
-                    plt.plot(dyn_means.index, dyn_means.values, style + '*', label=f'Dynamic {cond}', color='red')
-                    
-            plt.title(f"{target} Population Dynamics")
-            plt.legend()
+            subset = df_sorted[df_sorted['condition'] == cond]
+            if subset.empty: return
+            
+            if has_truth:
+                true_means = subset.groupby('time')[target].agg(['mean', 'std'])
+                ax.errorbar(true_means.index, true_means['mean'], yerr=true_means['std'], 
+                           fmt='-o', color='black', label=f'True {cond}', alpha=0.7, capsize=5)
+            
+            if has_static:
+                stat_means = subset.groupby('time')[pred_static_col].mean()
+                ax.plot(stat_means.index, stat_means.values, '--x', label=f'Static {cond}', color='blue', linewidth=2)
+            
+            if has_dynamic:
+                dyn_means = subset.groupby('time')[pred_dynamic_col].mean()
+                ax.plot(dyn_means.index, dyn_means.values, '-*', label=f'Dynamic {cond}', color='red', linewidth=2)
+            
+            ax.set_title(f"Population Dynamics ({cond})")
+            ax.set_xlabel("Time (h)")
+            ax.set_ylabel(target)
+            ax.legend()
+            ax.grid(True, linestyle='--', alpha=0.3)
+
+        # 2. Light Trajectory (Top Right: 2,2,2)
+        ax2 = plt.subplot(2, 2, 2)
+        plot_traj(ax2, 'Light')
+        
+        # 3. Dark Trajectory (Bottom Right: 2,2,4)
+        ax3 = plt.subplot(2, 2, 4)
+        plot_traj(ax3, 'Dark')
         
         plt.tight_layout()
         plt.savefig(f"MoE_Result_{target}.png", dpi=300)

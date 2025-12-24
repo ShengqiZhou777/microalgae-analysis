@@ -7,14 +7,15 @@ PATH_PREFIX = "data/"
 
 # ================= 训练参数 =================
 IMG_SIZE = (512, 512) 
-BATCH_SIZE = 128    
+BATCH_SIZE = 64
 EPOCHS = 15
-LR = 1e-5                    
+LR = 1e-5
+WINDOW_SIZE = 3 # Default Sliding Window Size (History)
 
 # ================= 验证策略 =================
 N_SPLITS = 5
 MAX_FOLDS = 1  
-MAX_VAL_BATCHES = 10
+
 
 # ================= 硬件配置 =================
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
