@@ -269,7 +269,7 @@ def main():
     
     # --- Pre-processing (Consistent with training pipeline) ---
     df['original_order'] = range(len(df))
-    df.loc[df['condition'] == 'Initial', 'condition'] = 'Light'
+    # df.loc[df['condition'] == 'Initial', 'condition'] = 'Light' # [REMOVED] Initial is now pre-split into Light/Dark in dataset
     
     # Sort and assign group_idx (Necessary for sequential matching)
     df = df.sort_values(by=['condition', 'time', 'file']).reset_index(drop=True)
@@ -300,57 +300,104 @@ def main():
     for target in TARGETS:
         print(f"-> Processing Target: {target}")
         
-        # 1. Static Prediction
-        print(f"   [Static] Predicting...")
-        try:
-            artifacts_static = load_moe_ensemble(target, f"weights/{target}_mean")
+    for target in TARGETS:
+        print(f"-> Processing Target: {target}")
+        
+        # We need to process Light and Dark separately because they use different models now
+        conditions = df['condition'].unique()
+        combined_pred_static = []
+        combined_pred_dynamic = []
+        
+        # We will iterate by condition subset
+        for cond in conditions:
+            if cond not in ["Light", "Dark"]:
+                # If there are other conditions (e.g. Initial), we might map them or skip
+                # Assuming 'Initial' is mapped or handled. If 'Initial' exists, usually mapped to Light in training?
+                # In main.py we saw: # df.loc[df['condition'] == 'Initial', 'condition'] = 'Light' was commented out.
+                # But typically Initial is treated as Light. Let's assume strict matching for now.
+                # If the user trains with "Light" and "Dark", Initial (0h) might have been passed to both or one.
+                # Let's try to map 'Initial' to 'Light' for inference if 'Light' model exists.
+                working_cond = "Light" if cond == "Initial" else cond
+            else:
+                working_cond = cond
+            
+            print(f"   [Condition: {cond}] (Using Model: {working_cond})")
+            subset_mask = df['condition'] == cond
+            subset_df = df[subset_mask].copy()
+            if subset_df.empty: continue
+            
+            # --- 1. Static Prediction ---
+            model_path_static = f"weights/{target}_{working_cond}_mean"
+            artifacts_static = load_moe_ensemble(target, model_path_static)
+            
             if artifacts_static:
-                pred_static, w_static, exp_static = predict_single_target(df, target, artifacts_static)
-                results[f"Pred_{target}_Static"] = pred_static
-                results[f"W_XGB_{target}_Static"] = w_static[:, 0]
-                results[f"W_LGB_{target}_Static"] = w_static[:, 1]
-                results[f"W_CNN_{target}_Static"] = w_static[:, 2]
+                p_s, w_s, exp_s = predict_single_target(subset_df, target, artifacts_static)
                 
-                # Save Individual Experts
-                if exp_static['xgb'] is not None: results[f"Pred_{target}_Static_XGB"] = exp_static['xgb']
-                if exp_static['lgb'] is not None: results[f"Pred_{target}_Static_LGB"] = exp_static['lgb']
+                # Store results aligned with index
+                subset_df[f"Pred_{target}_Static"] = p_s
+                subset_df[f"W_XGB_{target}_Static"] = w_s[:, 0]
+                subset_df[f"W_LGB_{target}_Static"] = w_s[:, 1]
+                subset_df[f"W_CNN_{target}_Static"] = w_s[:, 2]
+                
+                if exp_s['xgb'] is not None: subset_df[f"Pred_{target}_Static_XGB"] = exp_s['xgb']
+                if exp_s['lgb'] is not None: subset_df[f"Pred_{target}_Static_LGB"] = exp_s['lgb']
+                
+                combined_pred_static.append(subset_df)
             else:
-                print(f"   [WARN] Static model not found for {target}")
-        except Exception as e:
-            print(f"   [ERROR] Static inference failed: {e}")
-            import traceback
-            traceback.print_exc()
+                print(f"      [WARN] Static model not found: {model_path_static}")
+                # Append subset without preds locally, or handle missing
+                combined_pred_static.append(subset_df) # Will lack cols
 
-        # 2. Dynamic Prediction
-        print(f"   [Dynamic] Predicting...")
-        try:
-            artifacts_dynamic = load_moe_ensemble(target, f"weights/{target}_stochastic")
-            if artifacts_dynamic:
-                # Ensure df_dynamic has only the rows present in results, and align them
-                # (df_dynamic should already have all rows from the input)
-                pred_dynamic, w_dynamic, exp_dynamic = predict_single_target(df_dynamic, target, artifacts_dynamic)
+            # --- 2. Dynamic Prediction ---
+            # Dynamic needs df_dynamic subset
+            # Filter df_dynamic by file/time/condition matching the subset
+            # Faster: use boolean mask on df_dynamic if indices align? No, separate DF.
+            # We filter df_dynamic by the same condition
+            subset_dyn_mask = df_dynamic['condition'] == cond
+            subset_dyn = df_dynamic[subset_dyn_mask].copy()
+            
+            if not subset_dyn.empty:
+                model_path_dynamic = f"weights/{target}_{working_cond}_stochastic"
+                artifacts_dynamic = load_moe_ensemble(target, model_path_dynamic)
                 
-                # [CRITICAL] Align the predictions from df_dynamic back to results dataframe by file
-                pred_df = pd.DataFrame({
-                    'file': df_dynamic['file'],
-                    f"Pred_{target}_Dynamic": pred_dynamic,
-                    f"W_XGB_{target}_Dynamic": w_dynamic[:, 0],
-                    f"W_LGB_{target}_Dynamic": w_dynamic[:, 1],
-                    f"W_CNN_{target}_Dynamic": w_dynamic[:, 2]
-                })
-                # Add individual experts if they exist
-                if exp_dynamic['xgb'] is not None: pred_df[f"Pred_{target}_Dynamic_XGB"] = exp_dynamic['xgb']
-                if exp_dynamic['lgb'] is not None: pred_df[f"Pred_{target}_Dynamic_LGB"] = exp_dynamic['lgb']
+                if artifacts_dynamic:
+                    p_d, w_d, exp_d = predict_single_target(subset_dyn, target, artifacts_dynamic)
+                     # Create temp dataframe to merge
+                    res_dyn = pd.DataFrame({
+                        'file': subset_dyn['file'],
+                        'condition': subset_dyn['condition'],
+                        'time': subset_dyn['time'],
+                        f"Pred_{target}_Dynamic": p_d,
+                        f"W_XGB_{target}_Dynamic": w_d[:, 0],
+                        f"W_LGB_{target}_Dynamic": w_d[:, 1],
+                        f"W_CNN_{target}_Dynamic": w_d[:, 2]
+                    })
+                    if exp_d['xgb'] is not None: res_dyn[f"Pred_{target}_Dynamic_XGB"] = exp_d['xgb']
+                    if exp_d['lgb'] is not None: res_dyn[f"Pred_{target}_Dynamic_LGB"] = exp_d['lgb']
+                    
+                    combined_pred_dynamic.append(res_dyn)
+                else:
+                    print(f"      [WARN] Dynamic model not found: {model_path_dynamic}")
+
+        # --- Reassemble ---
+        # 1. Static: Concatenate valid parts
+        if combined_pred_static:
+            full_static = pd.concat(combined_pred_static)
+            # Update main results with static preds
+            # We use 'file' as key or index
+            # results is based on 'df'. full_static is subsets of 'df'.
+            # We can map by index if we kept it? 
+            # subset_df was a copy. Let's merge on file/condition/time.
+            cols_to_merge = [c for c in full_static.columns if c.startswith("Pred_") or c.startswith("W_")]
+            if cols_to_merge:
+                full_static_cut = full_static[['file', 'condition', 'time'] + cols_to_merge]
+                results = results.merge(full_static_cut, on=['file', 'condition', 'time'], how='left', suffixes=('', '_new'))
+                # Handle possible duplicates if any (shouldn't be)
                 
-                # Merge back to results efficiently
-                results = results.merge(pred_df, on='file', how='left')
-                
-            else:
-                print(f"   [WARN] Dynamic model not found for {target}")
-        except Exception as e:
-            print(f"   [ERROR] Dynamic inference failed for {target}: {e}")
-            import traceback
-            traceback.print_exc()
+        # 2. Dynamic: Concatenate
+        if combined_pred_dynamic:
+            full_dynamic = pd.concat(combined_pred_dynamic)
+            results = results.merge(full_dynamic, on=['file', 'condition', 'time'], how='left', suffixes=('', '_new'))
 
     # Calculate R2 if targets exist
     from sklearn.metrics import r2_score

@@ -61,8 +61,18 @@ def get_indices_head_tail():
     with open("results/dataset_group_indices_stable.json", "w") as f:
         json.dump(report, f, indent=4)
         
+    # [NEW] Overwrite the source CSVs with the correct internal splits (TRAIN/VAL)
+    # This ensures pipeline.py sees 'VAL' labels
+    df_train_new = df_all[df_all['split_set'].isin(['TRAIN', 'VAL'])].copy()
+    df_test_new = df_all[df_all['split_set'] == 'TEST'].copy()
+    
+    df_train_new.to_csv("data/dataset_train.csv", index=False)
+    df_test_new.to_csv("data/dataset_test.csv", index=False)
+    
     print("Done! Deterministic Head-Tail indices extracted.")
-    print("Files saved:")
+    print("Files updated:")
+    print(f"- data/dataset_train.csv ({len(df_train_new)} rows) -> Has TRAIN/VAL labels")
+    print(f"- data/dataset_test.csv ({len(df_test_new)} rows) -> Has TEST labels")
     print("- results/dataset_group_indices_stable.csv (Full Readable Mapping)")
     print("- results/dataset_group_indices_stable.json (Nested {Condition -> Time -> Split -> [IDs]})")
     

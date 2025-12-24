@@ -11,6 +11,8 @@ if __name__ == "__main__":
     parser.add_argument("--loo", action="store_true", help="Run LOO experiment")
     parser.add_argument("--stochastic", action="store_true", help="Use individual image matching for sliding window")
 
+    parser.add_argument("--condition", type=str, default="All", choices=["All", "Light", "Dark"], help="Filter by condition")
+
     args = parser.parse_args()
 
     if args.loo:
@@ -22,5 +24,6 @@ if __name__ == "__main__":
             mode=args.mode, 
             cv_method=args.cv_method,
             max_folds=mf,
-            stochastic_window=args.stochastic
+            stochastic_window=args.stochastic,
+            condition=args.condition
         )

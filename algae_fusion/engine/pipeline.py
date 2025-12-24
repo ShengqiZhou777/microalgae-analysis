@@ -31,7 +31,7 @@ class Log1pScaler:
     def __init__(self, s): self.s = s
     def inverse_transform(self, yp): return np.expm1(self.s.inverse_transform(yp.reshape(-1, 1)).flatten())
 
-def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_folds=None, hidden_times=None, stochastic_window=False):
+def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_folds=None, hidden_times=None, stochastic_window=False, condition=None):
     """
     target_name: "Dry_Weight" or "Fv_Fm"
     mode: "full", "xgb_only", "lgb_only", "cnn_only"
@@ -47,7 +47,16 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
     test_df = pd.read_csv("data/dataset_test.csv") if os.path.exists("data/dataset_test.csv") else pd.DataFrame()
     
     df = pd.concat([train_df, test_df], ignore_index=True)
-    df.loc[df['condition'] == 'Initial', 'condition'] = 'Light'
+    # df.loc[df['condition'] == 'Initial', 'condition'] = 'Light' # Removed to respect original content or upstream handling
+    
+    # --- [FILTER CONDITION] ---
+    if condition is not None and condition != "All":
+        print(f"  [Filter] Selecting only '{condition}' samples (plus Initial 0h if available)...")
+        # Ensure Initial is always included if needed, OR user handles it manually.
+        # Strict filtering:
+        df = df[df['condition'] == condition].reset_index(drop=True)
+        if df.empty:
+            raise ValueError(f"No samples found for condition '{condition}'!")
     
     # 1. Sort by condition/time/file for stable group_idx
     df = df.sort_values(by=['condition', 'time', 'file']).reset_index(drop=True)
@@ -312,7 +321,10 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
     # Save results
     # Save results structured
     history_str = "Dynamic" if stochastic_window else "Static"
-    output_dir = os.path.join("output", target_name, mode, history_str)
+    
+    # [FIX] Include condition in output path to prevent overwrites
+    cond_str = condition if condition else "All"
+    output_dir = os.path.join("output", target_name, mode, history_str, cond_str)
     os.makedirs(output_dir, exist_ok=True)
     
     df[f"Predicted_{target_name}"] = final_pred
@@ -346,7 +358,8 @@ def run_pipeline(target_name="Dry_Weight", mode="full", cv_method="group", max_f
     os.makedirs("weights", exist_ok=True)
     # Suffix logic: 'stochastic' for dynamic history, 'mean' for static (no history)
     suffix = "stochastic" if stochastic_window else "mean"
-    model_prefix = f"weights/{target_name}_{suffix}"
+    cond_str = condition if condition else "All"
+    model_prefix = f"weights/{target_name}_{cond_str}_{suffix}"
     
     # 1. Save Tabular Models
     if mode in ["full", "boost_only"]:
