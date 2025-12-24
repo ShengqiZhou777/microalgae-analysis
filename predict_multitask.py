@@ -16,7 +16,11 @@ from torchvision import transforms
 from algae_fusion.config import IMG_SIZE, DEVICE, BACKBONE, NON_FEATURE_COLS
 from algae_fusion.models.backbones import ResNetRegressor
 from algae_fusion.models.moe import GatingNetwork
+from algae_fusion.models.moe import GatingNetwork
 from algae_fusion.data.dataset import MaskedImageDataset
+from algae_fusion.models.lstm import MorphLSTM
+from algae_fusion.engine.pipeline import prepare_lstm_tensor
+
 
 # Define targets and their model file suffixes
 TARGETS = ["Dry_Weight", "Chl_Per_Cell", "Fv_Fm", "Oxygen_Rate"]
@@ -63,6 +67,13 @@ def load_moe_ensemble(target, model_prefix):
     lgb_path = f"{model_prefix}_lgb.joblib"
     if os.path.exists(lgb_path):
         artifacts['lgb2'] = joblib.load(lgb_path)
+        artifacts['lgb2'] = joblib.load(lgb_path)
+
+    # 1.5 Load LSTM Expert
+    # [REVERTED] LSTM removed.
+    pass
+
+
 
     # 2. Load Visual Expert (CNN)
     cnn_path = f"{model_prefix}_cnn.pth"
@@ -90,7 +101,17 @@ def load_moe_ensemble(target, model_prefix):
         actual_input_dim = state_dict_g['net.0.weight'].shape[1]
         
         print(f"  [Info] Gating Network input_dim: {actual_input_dim}")
-        g_net = GatingNetwork(input_dim=actual_input_dim).to(DEVICE)
+        # Weight shape for net.0 is [hidden_dim, input_dim]
+        actual_input_dim = state_dict_g['net.0.weight'].shape[1]
+        
+        # Infer num_experts from output layer 'net.6.weight' [num_experts, 32]
+        if 'net.6.weight' in state_dict_g:
+            num_experts = state_dict_g['net.6.weight'].shape[0]
+        else:
+            num_experts = 3 # fallback
+        
+        print(f"  [Info] Gating Network input_dim: {actual_input_dim}, num_experts: {num_experts}")
+        g_net = GatingNetwork(input_dim=actual_input_dim, num_experts=num_experts).to(DEVICE)
         g_net.load_state_dict(state_dict_g)
         g_net.eval()
         artifacts['g_net'] = g_net
@@ -125,9 +146,15 @@ def predict_single_target(df, target, artifacts):
     # Layer 2: Augment
     X_aug = X.copy()
     X_aug["XGB1_Feature"] = l1_feat
-    
+
+    # Layer 1.5: LSTM (Augment with Temporal Features)
+    # [REVERTED]
+    preds_map = {}
+
     # --- Run Experts ---
-    preds_map = {} # 'xgb', 'lgb', 'cnn'
+
+
+
     
     # 1. XGB2 (Expert 1)
     xgb2 = artifacts.get('xgb2')
@@ -142,8 +169,11 @@ def predict_single_target(df, target, artifacts):
         preds_map['lgb'] = lgb2.predict(X_aug)
     else:
         preds_map['lgb'] = np.zeros(len(df))
-        
+
+    
     # 3. CNN (Expert 3)
+
+
     cnn = artifacts.get('cnn')
     if cnn:
         # Prepare Images
@@ -209,28 +239,56 @@ def predict_single_target(df, target, artifacts):
             
     else:
         # Fallback: Simple Average of AVAILABLE experts
-        print("  [WARN] Gating Network missing. Using simple average of active experts.")
-        weights = np.zeros((len(df), 3))
+        print(f"  [WARN] Gating Network missing. Using simple average of active experts.")
         
         # Check which experts are active (artifacts loaded)
-        active_mask = [
-            1 if artifacts.get('xgb2') else 0,
-            1 if artifacts.get('lgb2') else 0,
-            1 if artifacts.get('cnn') else 0
-        ]
+        # Order: XGB, LGB, [LSTM], CNN
+        active_mask = [1 if artifacts.get('xgb2') else 0, 1 if artifacts.get('lgb2') else 0]
+        if 'lstm' in artifacts: active_mask.append(1)
+        active_mask.append(1 if artifacts.get('cnn') else 0)
+
+        num_experts = len(active_mask)
+        weights = np.zeros((len(df), num_experts))
+        
         active_count = sum(active_mask)
         if active_count > 0:
             avg_weight = 1.0 / active_count
-            for i in range(3):
+            for i in range(num_experts):
                 if active_mask[i]:
                     weights[:, i] = avg_weight
         else:
-            # Should not happen if at least one model loaded
              weights[:, 0] = 1.0 
 
     # --- Aggregate ---
-    # Stack experts: [N, 3] -> order MUST match training: XGB, LGB, CNN
-    E_preds = np.vstack([preds_map['xgb'], preds_map['lgb'], preds_map['cnn']]).T # [N, 3]
+    # --- Aggregate ---
+    # --- Aggregate ---
+    # Determine stacking based on Gating Weights dimension
+    num_expected = weights.shape[1]
+    
+    # Base: XGB, LGB
+    stack_list = [preds_map['xgb'], preds_map['lgb']]
+    
+    # If 4 experts: XGB, LGB, LSTM, CNN
+    if num_expected == 4:
+        lstm_p = preds_map.get('lstm', np.zeros(len(df)))
+        stack_list.append(lstm_p)
+        stack_list.append(preds_map['cnn'])
+        
+    # If 3 experts: XGB, LGB, CNN
+    elif num_expected == 3:
+        stack_list.append(preds_map['cnn'])
+        
+    # If 2 experts: XGB, LGB
+    else:
+        # Fallback or only 2
+        pass
+        
+    # Ensure dimensions match
+    # If mismatch (e.g. num_expected=5?), we might crash, but 2/3/4 covers our cases.
+
+    
+    E_preds = np.vstack(stack_list).T # [N, NumExperts]
+
     
     # Weighted Sum
     raw_final_pred = np.sum(weights * E_preds, axis=1)
@@ -239,8 +297,10 @@ def predict_single_target(df, target, artifacts):
     expert_raw = {
         'xgb': preds_map['xgb'],
         'lgb': preds_map['lgb'], 
-        'cnn': preds_map['cnn']
+        'cnn': preds_map.get('cnn', np.zeros(len(df)))
     }
+    if 'lstm' in preds_map: expert_raw['lstm'] = preds_map['lstm']
+
     
     # --- Inverse Transform ---
     scaler = artifacts.get('scaler')

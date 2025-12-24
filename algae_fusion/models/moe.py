@@ -7,7 +7,7 @@ class GatingNetwork(nn.Module):
     Input: Tabular Features (Morphology + History + Omics)
     Output: Softmax Weights [w_xgb, w_lgb, w_cnn]
     """
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, num_experts=3):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 64),
@@ -16,7 +16,7 @@ class GatingNetwork(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.Linear(32, 3), # 3 Experts
+            nn.Linear(32, num_experts), # Dynamic Experts
             nn.Softmax(dim=1)
         )
         

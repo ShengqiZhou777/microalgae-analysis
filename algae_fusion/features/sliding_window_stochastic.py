@@ -26,9 +26,23 @@ def compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=Non
         shift_data = []
         for t in all_times:
             idx = time_idx_map[t]
-            if idx - k < 0:
-                continue # No history available, leave as NaN
-            prev_idx = idx - k
+            idx = time_idx_map[t]
+            # Moved check down to allow for custom prev_idx mapping
+            # [USER REQUEST] Special Window Logic for 1h (Image Index 1)
+            # User wants: 1h -> Prev1=Self, Prev2=0h (Shifted window)
+            if idx == 1:
+                if k == 1:
+                    prev_idx = idx      # Prev1 uses Self
+                elif k == 2:
+                    prev_idx = idx - 1  # Prev2 uses 0h
+                else:
+                    prev_idx = idx - k  # Fallback for k>2
+            else:
+                prev_idx = idx - k
+
+            if prev_idx < 0:
+                continue # No history available, leave as NaN (handled by fillna later)
+                
             prev_t = all_times[prev_idx]
             
             # Get the pool of data from the previous timepoint
@@ -72,4 +86,17 @@ def compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=Non
         if not df_shift.empty:
             df_aug = df_aug.merge(df_shift, on=['file', 'time', 'condition'], how='left')
             
+            # [USER REQUEST] Fill Start-of-Experiment (0h) with SELF values instead of NaN
+            for m_col in morph_cols:
+                prev_col = f"Prev{k}_{m_col}"
+                if prev_col in df_aug.columns:
+                    df_aug[prev_col] = df_aug[prev_col].fillna(df_aug[m_col])
+                    
+            # For ID columns, we can fill with current ID (it's the same file anyway)
+            for id_col in id_cols:
+                prev_id = f"Prev{k}_{id_col}"
+                if prev_id in df_aug.columns:
+                    df_aug[prev_id] = df_aug[prev_id].fillna(df_aug[id_col])
+            
     return df_aug
+
