@@ -27,14 +27,14 @@ class Logger(object):
         self.terminal.flush()
         self.log.flush()
 
-def setup_logger(target_name, condition):
+def setup_logger(target_name, condition, prefix="Train"):
     # Create logs directory
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
     
     # Filename: logs/Train_DryWeight_Light_20231224_223000.log
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"{log_dir}/Train_{target_name}_{condition}_{now_str}.log"
+    log_filename = f"{log_dir}/{prefix}_{target_name}_{condition}_{now_str}.log"
     
     # Redirect stdout
     sys.stdout = Logger(log_filename)

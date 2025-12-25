@@ -1,4 +1,4 @@
-
+#检查训练集和测试集是否有重叠
 import pandas as pd
 
 def check_overlap():

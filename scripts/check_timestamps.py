@@ -1,4 +1,4 @@
-
+#检查拍摄时间戳是否能对上
 import os
 import glob
 from PIL import Image

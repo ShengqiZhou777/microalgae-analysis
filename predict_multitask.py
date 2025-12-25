@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import argparse
 import os
+import sys
 import joblib
 import json
 import torch
@@ -12,6 +13,8 @@ from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from torch.utils.data import DataLoader
 from torchvision import transforms
+import datetime
+from algae_fusion.utils.logger import setup_logger
 
 from algae_fusion.config import IMG_SIZE, DEVICE, BACKBONE, NON_FEATURE_COLS, WINDOW_SIZE
 from algae_fusion.models.backbones import ResNetRegressor
@@ -320,6 +323,19 @@ def main():
     parser.add_argument("--output", type=str, default="Final_MoE_Predictions.csv")
     args = parser.parse_args()
     
+    # [LOGGING SETUP]
+    sys.path.append(os.path.dirname(os.path.abspath(__file__))) 
+    setup_logger("Multitask", "All", prefix="Predict")
+    
+    # Generate Run Timestamp
+    run_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Update Output Filename with Timestamp (if not already present)
+    if not args.output.endswith(f"_{run_timestamp}.csv"):
+        base, ext = os.path.splitext(args.output)
+        args.output = f"{base}_{run_timestamp}{ext}"
+        print(f"--> Updated output filename to: {args.output}")
+    
     if not os.path.exists(args.input):
         print(f"Error: Input file {args.input} not found.")
         return
@@ -498,9 +514,9 @@ def main():
     print(f"Done! MoE results saved to: {args.output}")
     
     # Visualize
-    visualize_moe_results(results, TARGETS)
+    visualize_moe_results(results, TARGETS, timestamp=run_timestamp)
 
-def visualize_moe_results(df, targets):
+def visualize_moe_results(df, targets, timestamp=""):
     from sklearn.metrics import r2_score
     for target in targets:
         pred_static_col = f"Pred_{target}_Static"
@@ -533,6 +549,7 @@ def visualize_moe_results(df, targets):
             
             lims = [min(plt.xlim()[0], plt.ylim()[0]), max(plt.xlim()[1], plt.ylim()[1])]
             plt.plot(lims, lims, 'k--', alpha=0.75, zorder=0)
+            plt.gca().set_aspect('equal', adjustable='box') # Force square aspect ratio
             plt.title(f"{target}: True vs Pred\n{r2_str}")
             plt.xlabel(f"True {target}")
             plt.ylabel(f"Predicted {target}")
@@ -552,17 +569,16 @@ def visualize_moe_results(df, targets):
             if subset.empty: return
             
             if has_truth:
-                true_means = subset.groupby('time')[target].agg(['mean', 'std'])
-                ax.errorbar(true_means.index, true_means['mean'], yerr=true_means['std'], 
-                           fmt='-o', color='black', label=f'True {cond}', alpha=0.7, capsize=5)
+                true_means = subset.groupby('time')[target].mean()
+                ax.plot(true_means.index, true_means.values, '-o', color='black', label=f'True {cond}', alpha=0.7)
             
             if has_static:
-                stat_means = subset.groupby('time')[pred_static_col].mean()
-                ax.plot(stat_means.index, stat_means.values, '--x', label=f'Static {cond}', color='blue', linewidth=2)
+                stat = subset.groupby('time')[pred_static_col].agg(['mean', 'std'])
+                ax.errorbar(stat.index, stat['mean'], yerr=stat['std'], fmt='--x', label=f'Static {cond}', color='blue', linewidth=2, capsize=3, alpha=0.8)
             
             if has_dynamic:
-                dyn_means = subset.groupby('time')[pred_dynamic_col].mean()
-                ax.plot(dyn_means.index, dyn_means.values, '-*', label=f'Dynamic {cond}', color='red', linewidth=2)
+                dyn = subset.groupby('time')[pred_dynamic_col].agg(['mean', 'std'])
+                ax.errorbar(dyn.index, dyn['mean'], yerr=dyn['std'], fmt='-*', label=f'Dynamic {cond}', color='red', linewidth=2, capsize=3, alpha=0.8)
             
             ax.set_title(f"Population Dynamics ({cond})")
             ax.set_xlabel("Time (h)")
@@ -579,8 +595,9 @@ def visualize_moe_results(df, targets):
         plot_traj(ax3, 'Dark')
         
         plt.tight_layout()
-        plt.savefig(f"MoE_Result_{target}.png", dpi=300)
-        print(f"  -> Saved plot: MoE_Result_{target}.png")
+        plot_filename = f"MoE_Result_{target}_{timestamp}.png" if timestamp else f"MoE_Result_{target}.png"
+        plt.savefig(plot_filename, dpi=300)
+        print(f"  -> Saved plot: {plot_filename}")
 
 if __name__ == "__main__":
     main()

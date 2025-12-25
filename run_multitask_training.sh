@@ -16,13 +16,13 @@ for condition in "${CONDITIONS[@]}"; do
 
     for target in "${TARGETS[@]}"; do
         echo ""
-    # # 1. Static Model (No --stochastic)
-    # echo " -> Training Static Model for $target ($condition)..."
-    # python3 main.py --target "$target" --mode full --condition "$condition"
+    # 1. Static Model (No --stochastic)
+    echo " -> Training Static Model for $target ($condition)..."
+    python3 main.py --target "$target" --mode boost_only --condition "$condition"
     
     # 2. Dynamic Model (With --stochastic)
     echo " -> Training Dynamic Model for $target ($condition)..."
-    python3 main.py --target "$target" --mode full --stochastic --condition "$condition"
+    python3 main.py --target "$target" --mode boost_only --stochastic --condition "$condition"
         
         if [ $? -eq 0 ]; then
             echo "✅ Successfully trained $target ($condition)"

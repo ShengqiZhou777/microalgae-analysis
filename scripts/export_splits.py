@@ -1,4 +1,4 @@
-
+#导出训练集、验证集和测试集
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import GroupShuffleSplit

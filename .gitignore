@@ -11,3 +11,4 @@ __pycache__/
 !training_summary.csv
 .DS_Store
 archive/
+logs/
