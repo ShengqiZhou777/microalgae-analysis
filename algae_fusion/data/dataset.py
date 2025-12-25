@@ -81,6 +81,7 @@ class MaskedImageDataset(Dataset):
         curr_t = self.transform(curr_pil) if self.transform else transforms.ToTensor()(curr_pil)
         all_tensors.append(curr_t)
         
+        
         # 3. Stack along Channel dimension
         if len(all_tensors) > 1:
             stacked_tensor = torch.cat(all_tensors, dim=0)

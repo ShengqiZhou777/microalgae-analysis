@@ -382,7 +382,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         patience, no_improve = 5, 0
         for ep in range(EPOCHS):
             tr_loss = train_epoch(cnn, train_loader, criterion, optimizer)
-            val_loss, _ = eval_epoch(cnn, val_loader, criterion, max_batches=MAX_VAL_BATCHES)
+            val_loss, _ = eval_epoch(cnn, val_loader, criterion)
             print(f"  [Epoch {ep+1}/{EPOCHS}] Train Loss: {tr_loss:.4f} | Val Loss: {val_loss:.4f}")
             if val_loss < best_loss:
                 best_loss, best_state, no_improve = val_loss, cnn.state_dict(), 0
@@ -451,8 +451,6 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     g_net = GatingNetwork(input_dim=X_gating_val.shape[1], num_experts=num_experts).to(DEVICE)
     opt_g = optim.Adam(g_net.parameters(), lr=0.001)
     crit_g = nn.MSELoss()
-    y_g_val = torch.tensor(y_val_orig, dtype=torch.float32).to(DEVICE).view(-1, 1)
-    X_g_val = torch.tensor(X_gating_val, dtype=torch.float32).to(DEVICE)
     
     g_net.train()
     for _ in range(50):
