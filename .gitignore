@@ -12,3 +12,4 @@ __pycache__/
 .DS_Store
 archive/
 logs/
+!data/dataset_test.csv
