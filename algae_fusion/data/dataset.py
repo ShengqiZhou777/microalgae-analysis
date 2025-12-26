@@ -23,12 +23,16 @@ class MaskedImageDataset(Dataset):
     def _load_and_mask_image(self, source_path, file_name):
         """Helper to load and mask a single image."""
         base = file_name.replace("_mask.png", "").replace(".png", "")
-        # source_path might already have PATH_PREFIX joined if it was processed before, 
-        # but in __getitem__ we pass row["Source_Path"] which is relative to data/
-        full_source = os.path.join(PATH_PREFIX, source_path)
-        parent_folder = os.path.dirname(full_source)
-        image_path = os.path.join(parent_folder, "images", base + ".jpg")
-        mask_path = os.path.join(parent_folder, "masks", base + "_mask.png")
+        base = file_name.replace("_mask.png", "").replace(".png", "")
+        # source_path contains the specific subdirectory (e.g. TIMECOURSE/0h/images)
+        # We need to respect that structure.
+        image_dir = os.path.join(PATH_PREFIX, source_path)
+        # Assuming masks are in a sibling folder named 'masks' relative to 'images'
+        # e.g. TIMECOURSE/0h/images -> TIMECOURSE/0h/masks
+        mask_dir = image_dir.replace("images", "masks")
+        
+        image_path = os.path.join(image_dir, base + ".jpg")
+        mask_path = os.path.join(mask_dir, base + "_mask.png")
 
         img = cv2.imread(image_path)
         if img is None:
@@ -95,3 +99,96 @@ class MaskedImageDataset(Dataset):
             
         label = torch.tensor(label_val, dtype=torch.float32)
         return stacked_tensor, label
+
+class AlgaeTimeSeriesDataset(Dataset):
+    """
+    Dataset for Neural ODE / ODE-RNN.
+    Groups data by biological replicate ('file') to form time series.
+    Returns (times, features, mask, target_sequence)
+    """
+    def __init__(self, df, feature_cols, target_col, time_col='time', group_col='file'):
+        self.df = df.sort_values([group_col, time_col]).reset_index(drop=True)
+        self.feature_cols = feature_cols
+        self.target_col = target_col
+        self.time_col = time_col
+        self.group_col = group_col
+        
+        # Group data
+        self.groups = [g for _, g in self.df.groupby(group_col)]
+        
+        # [DEBUG] Verification
+        if len(self.groups) > 0:
+            avg_len = np.mean([len(g) for g in self.groups])
+            print(f"  [Dataset] Formed {len(self.groups)} sequences (Avg Length: {avg_len:.2f})")
+            # Print sample of first group
+            first_group = self.groups[0]
+            print(f"  [Sample 0] Times: {first_group[time_col].values}")
+        
+    def __len__(self):
+        return len(self.groups)
+    
+    def __getitem__(self, idx):
+        group = self.groups[idx]
+        
+        # Extract sequences
+        # T: Time points
+        t = group[self.time_col].values.astype(np.float32)
+        
+        # X: Features [L, D]
+        x = group[self.feature_cols].values.astype(np.float32)
+        
+        # Y: Targets [L, 1]
+        y = group[self.target_col].values.astype(np.float32)
+        
+        return {
+            'times': torch.tensor(t),
+            'features': torch.tensor(x),
+            'targets': torch.tensor(y),
+            'mask': torch.ones(len(t)) # All present
+        }
+
+def collate_ode_batch(batch):
+    """
+    Custom collate function to handle variable length time series.
+    Pads sequences to max length in batch.
+    """
+    # 1. Sort by length (descending) for packing if needed
+    batch.sort(key=lambda x: len(x['times']), reverse=True)
+    
+    max_len = max([len(x['times']) for x in batch])
+    feature_dim = batch[0]['features'].shape[1]
+    
+    padded_x = []
+    padded_y = []
+    padded_t = []
+    padded_mask = []
+    
+    for item in batch:
+        l = len(item['times'])
+        
+        # Features
+        px = torch.zeros(max_len, feature_dim)
+        px[:l] = item['features']
+        padded_x.append(px)
+        
+        # Targets
+        py = torch.zeros(max_len)
+        py[:l] = item['targets']
+        padded_y.append(py)
+        
+        # Times
+        pt = torch.zeros(max_len)
+        pt[:l] = item['times']
+        padded_t.append(pt)
+        
+        # Mask
+        pm = torch.zeros(max_len)
+        pm[:l] = 1
+        padded_mask.append(pm)
+        
+    return {
+        'features': torch.stack(padded_x), # [B, T, D]
+        'targets': torch.stack(padded_y),  # [B, T]
+        'times': torch.stack(padded_t),    # [B, T]
+        'mask': torch.stack(padded_mask)   # [B, T]
+    }

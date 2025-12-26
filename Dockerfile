@@ -3,10 +3,7 @@ FROM nvcr.io/nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y \
     python3.10 python3.10-dev python3-pip python3-venv \
-    git wget libgl1-mesa-glx libglib2.0-0 ffmpeg && \
-    ln -sf /usr/bin/python3.10 /usr/bin/python3 && \\
-    # also provide `python` command for scripts that call `python`
-    ln -sf /usr/bin/python3 /usr/bin/python
+    git wget libgl1-mesa-glx libglib2.0-0 ffmpeg
 
 RUN pip install --upgrade pip setuptools wheel
 
@@ -23,5 +20,10 @@ RUN pip install \
     scikit-image scikit-learn scipy pandas \
     xgboost lightgbm catboost \
     opencv-python-headless \
-    tqdm loguru fastremap roifile imgviz seaborn matplotlib
+    tqdm loguru fastremap roifile imgviz seaborn matplotlib torchdiffeq
+
+# Setup Python Aliases (Moved to end to preserve cache)
+RUN ln -sf /usr/bin/python3.10 /usr/bin/python3 && \
+    ln -sf /usr/bin/python3 /usr/bin/python
+
 WORKDIR /workspace

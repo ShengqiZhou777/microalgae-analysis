@@ -3,26 +3,31 @@ import numpy as np
 import argparse
 import os
 import sys
+import os
+
+# Add project root to sys.path BEFORE importing local modules
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 import joblib
 import json
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 import seaborn as sns
-from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
 from torch.utils.data import DataLoader
 from torchvision import transforms
 import datetime
 from algae_fusion.utils.logger import setup_logger
 
 from algae_fusion.config import IMG_SIZE, DEVICE, BACKBONE, NON_FEATURE_COLS, WINDOW_SIZE
-from algae_fusion.models.backbones import ResNetRegressor
-from algae_fusion.models.moe import GatingNetwork
+from algae_fusion.models.cnn import ResNetRegressor
+from algae_fusion.models.tabular import XGBoostExpert, LightGBMExpert
 from algae_fusion.models.moe import GatingNetwork
 from algae_fusion.data.dataset import MaskedImageDataset
-from algae_fusion.models.lstm import MorphLSTM
-from algae_fusion.engine.pipeline import prepare_lstm_tensor
+# from algae_fusion.models.lstm import MorphLSTM # LSTM removed
+# from algae_fusion.engine.pipeline import prepare_lstm_tensor # LSTM removed
 
 
 # Define targets and their model file suffixes
@@ -58,19 +63,20 @@ def load_moe_ensemble(target, model_prefix):
 
     # 1. Load Tabular Experts
     if os.path.exists(f"{model_prefix}_xgb1.json"):
-        xgb1 = XGBRegressor()
-        xgb1.load_model(f"{model_prefix}_xgb1.json")
+        xgb1 = XGBoostExpert()
+        xgb1.load(f"{model_prefix}_xgb1.json")
         artifacts['xgb1'] = xgb1
     
     if os.path.exists(f"{model_prefix}_xgb2.json"):
-        xgb2 = XGBRegressor()
-        xgb2.load_model(f"{model_prefix}_xgb2.json")
+        xgb2 = XGBoostExpert() # Note: hyperparams don't matter for loading
+        xgb2.load(f"{model_prefix}_xgb2.json")
         artifacts['xgb2'] = xgb2
     
     lgb_path = f"{model_prefix}_lgb.joblib"
     if os.path.exists(lgb_path):
-        artifacts['lgb2'] = joblib.load(lgb_path)
-        artifacts['lgb2'] = joblib.load(lgb_path)
+        lgb2 = LightGBMExpert()
+        lgb2.load(lgb_path)
+        artifacts['lgb2'] = lgb2
 
     # 1.5 Load LSTM Expert
     # [REVERTED] LSTM removed.
@@ -324,7 +330,6 @@ def main():
     args = parser.parse_args()
     
     # [LOGGING SETUP]
-    sys.path.append(os.path.dirname(os.path.abspath(__file__))) 
     setup_logger("Multitask", "All", prefix="Predict")
     
     # Generate Run Timestamp
@@ -488,13 +493,21 @@ def main():
             
             # Static R2
             if f"Pred_{target}_Static" in results.columns:
-                r2_static = r2_score(results[target], results[f"Pred_{target}_Static"])
-                print(f"   [Static]  R2 Score: {r2_static:.4f}")
+                valid_mask = results[f"Pred_{target}_Static"].notna() & results[target].notna()
+                if valid_mask.sum() > 0:
+                    r2_static = r2_score(results.loc[valid_mask, target], results.loc[valid_mask, f"Pred_{target}_Static"])
+                    print(f"   [Static]  R2 Score: {r2_static:.4f} (n={valid_mask.sum()})")
+                else:
+                    print(f"   [Static]  R2 Score: N/A (No valid predictions)")
             
             # Dynamic R2
             if f"Pred_{target}_Dynamic" in results.columns:
-                r2_dynamic = r2_score(results[target], results[f"Pred_{target}_Dynamic"])
-                print(f"   [Dynamic] R2 Score: {r2_dynamic:.4f}")
+                valid_mask = results[f"Pred_{target}_Dynamic"].notna() & results[target].notna()
+                if valid_mask.sum() > 0:
+                    r2_dynamic = r2_score(results.loc[valid_mask, target], results.loc[valid_mask, f"Pred_{target}_Dynamic"])
+                    print(f"   [Dynamic] R2 Score: {r2_dynamic:.4f} (n={valid_mask.sum()})")
+                else:
+                    print(f"   [Dynamic] R2 Score: N/A (No valid predictions)")
 
     # Save
     out_dir = os.path.dirname(args.output)
