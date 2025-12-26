@@ -1,4 +1,4 @@
-data/      
+data/*
 !algae_fusion/data/ 
 *.png
 *.tif
