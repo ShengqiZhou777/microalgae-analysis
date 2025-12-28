@@ -9,6 +9,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", type=str, default="full", choices=["full", "cnn_only", "boost_only", "ode"])
     parser.add_argument("--stochastic", action="store_true", help="Use individual image matching for sliding window")
     parser.add_argument("--condition", type=str, default="All", choices=["All", "Light", "Dark"], help="Filter by condition")
+    parser.add_argument("--population-mean", action="store_true", help="Use population-mean time series for ODE mode")
     args = parser.parse_args()
     
     # [LOGGING SETUP]
@@ -21,5 +22,6 @@ if __name__ == "__main__":
         target_name=args.target, 
         mode=args.mode, 
         stochastic_window=args.stochastic,
-        condition=args.condition
+        condition=args.condition,
+        population_mean=args.population_mean
     )

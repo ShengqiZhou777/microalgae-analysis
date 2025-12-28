@@ -19,7 +19,7 @@ for condition in "${CONDITIONS[@]}"; do
         # 1. Neural ODE Model
         echo " -> Training ODE Model for $target ($condition)..."
         # ODE trains on standard sequences (no stochastic history needed)
-        python3 main.py --target "$target" --mode ode --condition "$condition"
+        python3 main.py --target "$target" --mode ode --condition "$condition" --population-mean
 
         if [ $? -eq 0 ]; then
             echo "✅ Successfully trained ODE for $target ($condition)"

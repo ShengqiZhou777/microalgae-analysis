@@ -152,13 +152,15 @@ class GrowthODE(nn.Module):
     New 'Neural' GrowthODE.
     Combines Parameterizer (Encoder) + Neural ODE Solver.
     """
-    def __init__(self, model_type="ode_rnn", input_dim=2, hidden_dim=64):
+    def __init__(self, model_type="ode_rnn", input_dim=2, latent_dim=64, ode_hidden_dim=128, hidden_dim=None):
         super().__init__()
+        if hidden_dim is not None:
+            latent_dim = hidden_dim
         # model_type argument kept for compatibility
         # For pipeline compatibility, we use ODERNN
         # input_dim: features from dataset
         # hidden_dim: latent state size of ODE
-        self.ode_net = ODERNN(input_dim, hidden_dim)
+        self.ode_net = ODERNN(input_dim, latent_dim, hidden_dim=ode_hidden_dim)
         
     def forward(self, x, t, mask=None):
         """
