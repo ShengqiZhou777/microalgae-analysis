@@ -13,3 +13,5 @@ __pycache__/
 archive/
 logs/
 !data/dataset_test.csv
+!data/dataset_val.csv
+!data/dataset_train.csv
