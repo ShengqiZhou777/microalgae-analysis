@@ -19,14 +19,18 @@ for condition in "${CONDITIONS[@]}"; do
         # 1. Neural ODE Model
         echo " -> Training ODE Model for $target ($condition)..."
         # ODE trains on standard sequences (no stochastic history needed)
-        python3 main.py --target "$target" --mode ode --condition "$condition" --population-mean
+        python3 main.py --target "$target" --mode ode --condition "$condition" 
 
         if [ $? -eq 0 ]; then
             echo "✅ Successfully trained ODE for $target ($condition)"
             
             # 2. Forecasting Test
-            echo " -> Testing Forecasting Ability (Cutoff 6.0h)..."
-            python3 scripts/test_ode_forecast.py --target "$target" --condition "$condition" --cutoff 6.0
+            # echo " -> Testing Forecasting Ability (Cutoff 6.0h)..."
+            # python3 scripts/test_ode_forecast.py --target "$target" --condition "$condition" --cutoff 6.0
+
+            # 3. Test Set Prediction
+            echo " -> Generating Predictions on Test Set..."
+            python3 scripts/predict_ode_test.py --target "$target" --condition "$condition" 
             
         else
             echo "❌ Failed to train ODE for $target ($condition)"

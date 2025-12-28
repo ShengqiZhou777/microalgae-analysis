@@ -8,6 +8,9 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import r2_score, mean_squared_error
 
 sys.path.append(os.getcwd())
 
@@ -153,6 +156,77 @@ def main():
     output_path = args.output or f"results/ode_predictions/{args.target}_{args.condition}_test_predictions.csv"
     df_out.to_csv(output_path, index=False)
     print(f"Saved predictions to {output_path}")
+
+    # --- Visualization ---
+    plot_dir = "results/ode_plots"
+    os.makedirs(plot_dir, exist_ok=True)
+    
+    plt.figure(figsize=(10, 6))
+    
+    # Plot true vs pred for each group
+    group_col = "condition" if use_population_mean else ("group_idx" if "group_idx" in df_pred.columns else "file")
+    unique_groups = df_pred[group_col].unique()
+    
+    # Limit to reasonable number for visualization if not population mean
+    if not use_population_mean and len(unique_groups) > 20:
+        print(f"Plotting subset of 20/{len(unique_groups)} groups for trajectory viz...")
+        viz_groups = unique_groups[:20]
+    else:
+        viz_groups = unique_groups
+        
+    for gid in viz_groups:
+        sub = df_pred[df_pred[group_col] == gid]
+        sub = sub.sort_values("time")
+        
+        # True
+        if args.target in sub.columns:
+            plt.plot(sub["time"], sub[args.target], 'o-', alpha=0.3, color='black', label='Ground Truth' if gid == viz_groups[0] else "")
+            
+        # Pred
+        plt.plot(sub["time"], sub[f"{args.target}_pred"], '--', alpha=0.7, color='red', label='ODE Prediction' if gid == viz_groups[0] else "")
+
+    plt.xlabel("Time (h)")
+    plt.ylabel(args.target)
+    plt.title(f"ODE Test Predictions (Trajectory): {args.target} ({args.condition})")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    traj_path = f"{plot_dir}/{args.target}_{args.condition}_trajectory.png"
+    plt.savefig(traj_path, dpi=150)
+    plt.close()
+    print(f"Saved trajectory visualization to {traj_path}")
+
+    # --- Scatter Plot (All Data) ---
+    if args.target in df_out.columns:
+        y_true = df_out[args.target].values
+        y_pred = df_out[f"{args.target}_pred"].values
+        
+        # Remove NaNs
+        mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
+        y_true = y_true[mask]
+        y_pred = y_pred[mask]
+        
+        if len(y_true) > 0:
+            r2 = r2_score(y_true, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+            
+            plt.figure(figsize=(6, 6))
+            plt.scatter(y_true, y_pred, alpha=0.5, color='blue')
+            
+            # Diagonal line
+            min_val = min(y_true.min(), y_pred.min())
+            max_val = max(y_true.max(), y_pred.max())
+            plt.plot([min_val, max_val], [min_val, max_val], 'k--', alpha=0.5)
+            
+            plt.xlabel(f"True {args.target}")
+            plt.ylabel(f"Predicted {args.target}")
+            plt.title(f"ODE Scatter: {args.target} ({args.condition})\nR2={r2:.3f}, RMSE={rmse:.3f}")
+            plt.grid(True, alpha=0.3)
+            
+            scatter_path = f"{plot_dir}/{args.target}_{args.condition}_scatter.png"
+            plt.savefig(scatter_path, dpi=150)
+            plt.close()
+            print(f"Saved scatter visualization to {scatter_path}")
 
 
 if __name__ == "__main__":
