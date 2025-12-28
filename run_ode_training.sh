@@ -23,6 +23,11 @@ for condition in "${CONDITIONS[@]}"; do
 
         if [ $? -eq 0 ]; then
             echo "✅ Successfully trained ODE for $target ($condition)"
+            
+            # 2. Forecasting Test
+            echo " -> Testing Forecasting Ability (Cutoff 6.0h)..."
+            python3 scripts/test_ode_forecast.py --target "$target" --condition "$condition" --cutoff 6.0
+            
         else
             echo "❌ Failed to train ODE for $target ($condition)"
             exit 1
@@ -49,6 +54,11 @@ echo "=================================================="
 
 mkdir -p "${ARCHIVE_DIR}/plots"
 mkdir -p "${ARCHIVE_DIR}/logs"
+mkdir -p "${ARCHIVE_DIR}/weights"
+
+# Move Weights (ODE models and scalers)
+echo " -> Moving ODE weights..."
+mv weights/ode_* "${ARCHIVE_DIR}/weights/" 2>/dev/null
 
 # Move Plots (ODE generates them in results/ode_plots/)
 if [ -d "results/ode_plots" ]; then

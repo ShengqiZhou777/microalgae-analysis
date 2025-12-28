@@ -59,7 +59,7 @@ def test_ode_counterfactual(target, condition):
             return self.proj(h) # pipeline.py uses .squeeze(-1) but here we handle shape carefully
 
     input_dim = len(feature_cols)
-    hidden_dim = 32 # From pipeline default
+    hidden_dim = 64 # Updated to match training config
     ode_core = GrowthODE(input_dim=input_dim, hidden_dim=hidden_dim).to(DEVICE)
     model = ODEProjector(ode_core, hidden_dim).to(DEVICE)
     

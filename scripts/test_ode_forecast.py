@@ -60,13 +60,11 @@ def test_ode_forecast(target, condition, cutoff_time=6):
 
     # 4. Load Model
     input_dim = len(feature_cols)
-    hidden_dim = 32 
+    hidden_dim = 64 # Updated to match training config 
     ode_core = GrowthODE(input_dim=input_dim, hidden_dim=hidden_dim).to(DEVICE)
     model = ODEProjector(ode_core, hidden_dim).to(DEVICE)
     
-    model_path = f"archive_run_20251225_153705/weights/ode_{target}_{condition}.pth"
-    if not os.path.exists(model_path):
-        model_path = f"weights/ode_{target}_{condition}.pth" # Fallback
+    model_path = f"weights/ode_{target}_{condition}.pth"
     
     if not os.path.exists(model_path):
         print(f"Model not found: {model_path}")
@@ -134,7 +132,7 @@ def test_ode_forecast(target, condition, cutoff_time=6):
         print(f"Time Range: > {cutoff_time}h (e.g., 12h, 24h, 48h, 72h)")
         print(f"Number of Future Points Predicted: {len(true_inv)}")
         print(f"R2 Score: {r2:.4f}")
-        print(f"MSE:      {mse:.4f}")
+        print(f"MSE:      {mse:.8f}")
         
         # Plotting (Optional - first 5 sequences)
         # Choose a sample with long history
@@ -148,10 +146,10 @@ def test_ode_forecast(target, condition, cutoff_time=6):
         
         # Cutoff Line
         print("\n[Sample Trajectory Check]")
-        print("Time | True | Pred (Forecast)")
+        print("Time | True      | Pred (Forecast)")
         for t_val, yt, yp in zip(t_seq, y_vis_true, y_vis_pred):
             marker = "*" if t_val > cutoff_time else " "
-            print(f"{t_val:3.0f}h | {yt:.2f} | {yp:.2f} {marker}")
+            print(f"{t_val:3.0f}h | {yt:.6f} | {yp:.6f} {marker}")
             
     else:
         print("No future points found to evaluate!")

@@ -10,7 +10,7 @@ IMG_SIZE = (512, 512)
 BATCH_SIZE = 128
 EPOCHS = 5
 LR = 1e-5
-WINDOW_SIZE = 2 # Default Sliding Window Size (History)
+WINDOW_SIZE = 3 # Default Sliding Window Size (History)
 
 # ================= 验证策略 =================
 N_SPLITS = 5

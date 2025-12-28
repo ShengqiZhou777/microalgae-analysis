@@ -318,7 +318,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         # Initialize Neural ODE-RNN
         # Initialize Neural ODE-RNN
         input_dim = len(feature_cols)
-        latent_dim = 32 # Increased from 16 for better capacity
+        latent_dim = 64 # Increased from 32 for even better capacity (Complex Dynamics)
         # For target prediction, we map latent -> target (scalar)
         # We need a small decoder on top of ODE output if latent != 1
         
@@ -342,16 +342,16 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
 
         model = ODEProjector(ode_model, latent_dim).to(DEVICE)
         
-        optimizer = optim.Adam(model.parameters(), lr=5e-4) # Lowered LR for stability
+        optimizer = optim.Adam(model.parameters(), lr=1e-4) # Lowered LR even further for stability
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20) # Increased patience
         criterion = nn.MSELoss(reduction='none') 
         
         best_loss = float('inf')
         best_model_state = None
         patience_counter = 0
-        early_stop_patience = 50 # Increased patience for volatile masking training
+        early_stop_patience = 100 # Increased patience for volatile masking training
         
-        epochs = 150 # Increased epochs
+        epochs = 300 # Increased epochs to ensure convergence
         print(f"  [ODE] Starting Training for {epochs} epochs...")
 
         for ep in range(epochs):
@@ -366,8 +366,8 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
                 input_mask = loss_mask.clone()
                 
                 # === [Forecasting Upgrade] Randomized Scheduled Sampling ===
-                # 80% chance to mask future data during training (Aggressive Forecasting)
-                if np.random.rand() > 0.2:
+                # 60% chance to mask future data (Reduced from 80% to stabilize convergence)
+                if np.random.rand() > 0.4:
                     seq_len = x.shape[1]
                     # Choose a random cutoff point (must have at least 1 input)
                     if seq_len > 2:
@@ -513,6 +513,14 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
                 plt.savefig(scatter_path, dpi=150, bbox_inches='tight')
                 print(f"  [ODE] Test Scatter Plot saved to {scatter_path}")
                 plt.close('all')
+
+        # [FIX] Save model and scaler before returning
+        os.makedirs("weights", exist_ok=True)
+        model_prefix = f"weights/ode_{target_name}_{condition}"
+        torch.save(model.state_dict(), f"{model_prefix}.pth")
+        if pt_fold:
+             joblib.dump(pt_fold, f"{model_prefix}_scaler.joblib")
+        print(f"  [SUCCESS] ODE Model saved to {model_prefix}.pth")
 
         return 
 
