@@ -51,7 +51,7 @@ def set_seed(seed=3407):
 
 
 
-def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stochastic_window=False, condition=None, window_size=None):
+def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stochastic_window=False, condition=None, window_size=None, population_mean=False):
     """
     Orchestrate the full training pipeline.
     
@@ -286,7 +286,32 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     # --- Neural ODE Mode ---
     if mode == "ode":
         from algae_fusion.data.dataset import AlgaeTimeSeriesDataset, collate_ode_batch
+
+        def aggregate_population_mean(df_in, split_label):
+            if df_in.empty:
+                return df_in
+            df_out = df_in.copy()
+            df_out['time'] = pd.to_numeric(df_out['time'], errors='coerce')
+            group_cols = ['condition', 'time']
+            numeric_cols = df_out.select_dtypes(include=[np.number]).columns.tolist()
+            grouped = df_out.groupby(group_cols, as_index=False)[numeric_cols].mean()
+            grouped['split_set'] = split_label
+            if 'Source_Path' in df_out.columns:
+                src = df_out.groupby(group_cols)['Source_Path'].first().reset_index()
+                grouped = grouped.merge(src, on=group_cols, how='left')
+            if 'file' in df_out.columns:
+                grouped['file'] = grouped.apply(
+                    lambda row: f"{row['condition']}_{row['time']}_mean",
+                    axis=1
+                )
+            return grouped
         
+        # Optionally collapse to population means per time/condition
+        if population_mean:
+            df_train_fold = aggregate_population_mean(df_train_fold, "TRAIN")
+            df_val_fold = aggregate_population_mean(df_val_fold, "VAL")
+            df_test = aggregate_population_mean(df_test, "TEST")
+
         # Use numerical tabular columns as input features
         # Filter out metadata
         feature_cols = [c for c in df_train_fold.columns if c not in NON_FEATURE_COLS + [target_name]]
@@ -305,7 +330,10 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         # Datasets (using fold splits which are already grouped by file)
         # CHECK: Use 'group_idx' if available, otherwise 'file' might be unique images
         # The dataframe uses 'group_idx' for biological replicates (generated in load_and_preprocess_data)
-        group_col = 'group_idx' if 'group_idx' in df_train_fold.columns else 'file'
+        if population_mean:
+            group_col = 'condition'
+        else:
+            group_col = 'group_idx' if 'group_idx' in df_train_fold.columns else 'file'
         
         train_ds = AlgaeTimeSeriesDataset(df_train_fold, feature_cols, target_name, group_col=group_col)
         val_ds = AlgaeTimeSeriesDataset(df_val_fold, feature_cols, target_name, group_col=group_col)
@@ -354,6 +382,9 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         epochs = 300 # Increased epochs to ensure convergence
         print(f"  [ODE] Starting Training for {epochs} epochs...")
 
+        time_scale = pd.to_numeric(df_train_fold['time'], errors='coerce').max()
+        time_scale = float(time_scale) if pd.notna(time_scale) and time_scale > 0 else 1.0
+
         for ep in range(epochs):
             model.train()
             ep_loss = 0
@@ -361,7 +392,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
             for batch in train_loader:
                 x = batch['features'].to(DEVICE)
                 y = batch['targets'].to(DEVICE)
-                t_idx = torch.arange(x.shape[1], dtype=torch.float32).to(DEVICE)
+                t_grid = batch['times'][0].to(DEVICE) / time_scale
                 loss_mask = batch['mask'].to(DEVICE)
                 input_mask = loss_mask.clone()
                 
@@ -375,7 +406,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
                         input_mask[:, cut_idx:] = 0
                 
                 optimizer.zero_grad()
-                pred = model(x, t_idx, input_mask)
+                pred = model(x, t_grid, input_mask)
                 
                 # Loss is calculated against ALL valid targets (using loss_mask)
                 # Even the ones we hid from input!
@@ -394,9 +425,9 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
                 for batch in val_loader:
                     x = batch['features'].to(DEVICE)
                     y = batch['targets'].to(DEVICE)
-                    t_idx = torch.arange(x.shape[1], dtype=torch.float32).to(DEVICE)
+                    t_grid = batch['times'][0].to(DEVICE) / time_scale
                     mask = batch['mask'].to(DEVICE)
-                    pred = model(x, t_idx, mask)
+                    pred = model(x, t_grid, mask)
                     loss = (criterion(pred, y) * mask).sum() / mask.sum()
                     val_loss += loss.item()
                     val_count += 1
@@ -435,11 +466,11 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
             batch = next(iter(test_loader))
             x = batch['features'].to(DEVICE)
             y_true_all = batch['targets'].cpu().numpy()
-            t_idx = torch.arange(x.shape[1], dtype=torch.float32).to(DEVICE)
+            t_grid = batch['times'][0].to(DEVICE) / time_scale
             mask = batch['mask'].to(DEVICE)
             
             # Predict for ALL samples
-            y_pred_all = model(x, t_idx, mask).cpu().numpy() # [N, T]
+            y_pred_all = model(x, t_grid, mask).cpu().numpy() # [N, T]
             times = batch['times'][0].numpy() # Use first sample's time grid (assumed uniform)
             mask_np = mask.cpu().numpy()
             
@@ -641,5 +672,4 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         json.dump(metadata, f)
     
     print(f"  [SUCCESS] All models saved to: {model_prefix}_*")
-
 

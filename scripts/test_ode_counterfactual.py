@@ -72,6 +72,8 @@ def test_ode_counterfactual(target, condition):
     
     # === Helper Inference ===
     def run_inference(df_in):
+        time_scale = pd.to_numeric(df_in['time'], errors='coerce').max()
+        time_scale = float(time_scale) if pd.notna(time_scale) and time_scale > 0 else 1.0
         ds = AlgaeTimeSeriesDataset(df_in, feature_cols, target, group_col=group_col)
         dl = DataLoader(ds, batch_size=len(ds), collate_fn=collate_ode_batch, shuffle=False)
         
@@ -83,20 +85,9 @@ def test_ode_counterfactual(target, condition):
                 x = batch['features'].to(DEVICE)
                 mask = batch['mask'].to(DEVICE)
                 targets = batch['targets'].to(DEVICE)
-                t = batch['times'].to(DEVICE) # [B, T]
+                t_grid = batch['times'][0].to(DEVICE) / time_scale
                 
-                # Note: ODERNN forward expects [T] usually if strictly numerical.
-                # But our collate returns [B, T].
-                # Let's check GrowthODE forward. It just passes to ODERNN.
-                # ODERNN forward(x, t, mask).
-                # t needs to be passed correctly. 
-                # If t is [B, T], code needs to support it. 
-                # Assuming visualization script works, it expects t as [T] usually?
-                # visualize_ode_latent passed: t = torch.arange(x.shape[1])
-                # Let's stick to that index-based time for now as trained.
-                t_idx = torch.arange(x.shape[1], dtype=torch.float32).to(DEVICE)
-                
-                pred_y = model(x, t_idx, mask) # [B, T, 1]
+                pred_y = model(x, t_grid, mask) # [B, T, 1]
                 
                 # Flatten valid predictions
                 mask_bool = mask.bool()

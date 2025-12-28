@@ -103,11 +103,13 @@ def test_ode_forecast(target, condition, cutoff_time=6):
     # So if m=0, GRU(x, h) is calculated but multiplied by 0. 
     # The state h is carried over (via ODE integration from previous step).
     
-    t_idx = torch.arange(x.shape[1], dtype=torch.float32).to(DEVICE)
+    time_scale = pd.to_numeric(df_test['time'], errors='coerce').max()
+    time_scale = float(time_scale) if pd.notna(time_scale) and time_scale > 0 else 1.0
+    t_grid = batch['times'][0].to(DEVICE) / time_scale
     
     with torch.no_grad():
         # Predict using partial history
-        pred_y_forecast = model(x, t_idx, forecast_mask) # [B, T, 1]
+        pred_y_forecast = model(x, t_grid, forecast_mask) # [B, T, 1]
     
     # Evaluate on the HIDDEN part (Future)
     # We want to check accuracy on times > cutoff_time
