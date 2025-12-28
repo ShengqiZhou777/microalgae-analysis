@@ -337,6 +337,14 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         
         train_ds = AlgaeTimeSeriesDataset(df_train_fold, feature_cols, target_name, group_col=group_col)
         val_ds = AlgaeTimeSeriesDataset(df_val_fold, feature_cols, target_name, group_col=group_col)
+
+        seq_lengths = [len(g) for g in train_ds.groups]
+        avg_seq_len = float(np.mean(seq_lengths)) if seq_lengths else 0.0
+        num_sequences = len(train_ds)
+        if population_mean:
+            print("  [ODE] Population-mean mode reduces to one sequence per condition.")
+            print(f"  [ODE] Training sequences: {num_sequences} | Avg length: {avg_seq_len:.2f}")
+        small_data = population_mean and (num_sequences <= 2 or avg_seq_len <= 10)
         
         train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_ode_batch)
         val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_ode_batch)
@@ -344,13 +352,30 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         print(f"  [ODE] Training on {len(train_ds)} sequences, Validating on {len(val_ds)} sequences")
         
         # Initialize Neural ODE-RNN
-        # Initialize Neural ODE-RNN
         input_dim = len(feature_cols)
-        latent_dim = 64 # Increased from 32 for even better capacity (Complex Dynamics)
+        if small_data:
+            print("  [ODE Warning] Very few time points detected; using a smaller ODE to reduce overfitting.")
+            latent_dim = 8
+            ode_hidden_dim = 32
+            decoder_hidden = 16
+            decoder_dropout = 0.0
+            epochs = 150
+            early_stop_patience = 30
+            lr = 5e-4
+            use_future_masking = False
+        else:
+            latent_dim = 64 # Increased from 32 for even better capacity (Complex Dynamics)
+            ode_hidden_dim = 128
+            decoder_hidden = 64
+            decoder_dropout = 0.2
+            epochs = 300
+            early_stop_patience = 100
+            lr = 1e-4
+            use_future_masking = True
         # For target prediction, we map latent -> target (scalar)
         # We need a small decoder on top of ODE output if latent != 1
         
-        ode_model = GrowthODE(input_dim=input_dim, hidden_dim=latent_dim).to(DEVICE)
+        ode_model = GrowthODE(input_dim=input_dim, latent_dim=latent_dim, ode_hidden_dim=ode_hidden_dim).to(DEVICE)
         # Wrapper to project latent to target
         class ODEProjector(nn.Module):
             def __init__(self, ode, latent_dim):
@@ -358,10 +383,10 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
                 self.ode = ode
                 # MLP Decoder instead of linear for better mapping
                 self.proj = nn.Sequential(
-                    nn.Linear(latent_dim, 64),
+                    nn.Linear(latent_dim, decoder_hidden),
                     nn.Tanh(),
-                    nn.Dropout(p=0.2), # Decoder Regularization
-                    nn.Linear(64, 1)
+                    nn.Dropout(p=decoder_dropout), # Decoder Regularization
+                    nn.Linear(decoder_hidden, 1)
                 )
             def forward(self, x, t, mask):
                 # ODERNN returns [B, T, latent]
@@ -370,16 +395,13 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
 
         model = ODEProjector(ode_model, latent_dim).to(DEVICE)
         
-        optimizer = optim.Adam(model.parameters(), lr=1e-4) # Lowered LR even further for stability
+        optimizer = optim.Adam(model.parameters(), lr=lr) # Lowered LR even further for stability
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20) # Increased patience
         criterion = nn.MSELoss(reduction='none') 
         
         best_loss = float('inf')
         best_model_state = None
         patience_counter = 0
-        early_stop_patience = 100 # Increased patience for volatile masking training
-        
-        epochs = 300 # Increased epochs to ensure convergence
         print(f"  [ODE] Starting Training for {epochs} epochs...")
 
         time_scale = pd.to_numeric(df_train_fold['time'], errors='coerce').max()
@@ -398,7 +420,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
                 
                 # === [Forecasting Upgrade] Randomized Scheduled Sampling ===
                 # 60% chance to mask future data (Reduced from 80% to stabilize convergence)
-                if np.random.rand() > 0.4:
+                if use_future_masking and np.random.rand() > 0.4:
                     seq_len = x.shape[1]
                     # Choose a random cutoff point (must have at least 1 input)
                     if seq_len > 2:
@@ -549,6 +571,17 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         os.makedirs("weights", exist_ok=True)
         model_prefix = f"weights/ode_{target_name}_{condition}"
         torch.save(model.state_dict(), f"{model_prefix}.pth")
+        ode_config = {
+            "latent_dim": latent_dim,
+            "ode_hidden_dim": ode_hidden_dim,
+            "decoder_hidden": decoder_hidden,
+            "decoder_dropout": decoder_dropout,
+            "population_mean": population_mean,
+            "num_sequences": num_sequences,
+            "avg_sequence_length": avg_seq_len,
+        }
+        with open(f"{model_prefix}_config.json", "w") as config_file:
+            json.dump(ode_config, config_file, indent=2)
         if pt_fold:
              joblib.dump(pt_fold, f"{model_prefix}_scaler.joblib")
         print(f"  [SUCCESS] ODE Model saved to {model_prefix}.pth")
@@ -672,4 +705,3 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
         json.dump(metadata, f)
     
     print(f"  [SUCCESS] All models saved to: {model_prefix}_*")
-

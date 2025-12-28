@@ -4,6 +4,7 @@ import sys
 import torch
 import torch.nn as nn
 import joblib
+import json
 import pandas as pd
 import numpy as np
 from torch.utils.data import DataLoader
@@ -15,6 +16,20 @@ sys.path.append(os.getcwd())
 from algae_fusion.config import DEVICE, NON_FEATURE_COLS
 from algae_fusion.models.ode import GrowthODE
 from algae_fusion.data.dataset import AlgaeTimeSeriesDataset, collate_ode_batch
+
+def load_ode_config(target, condition):
+    config_path = f"weights/ode_{target}_{condition}_config.json"
+    defaults = {
+        "latent_dim": 64,
+        "ode_hidden_dim": 128,
+        "decoder_hidden": 64,
+        "decoder_dropout": 0.2,
+    }
+    if not os.path.exists(config_path):
+        return defaults
+    with open(config_path, "r") as config_file:
+        config = json.load(config_file)
+    return {**defaults, **config}
 
 def test_ode_counterfactual(target, condition):
     print(f"=== Testing Neural ODE Feature Reliance: {target} ({condition}) ===")
@@ -40,28 +55,35 @@ def test_ode_counterfactual(target, condition):
     
     # 4. Load Model
     from algae_fusion.models.ode import GrowthODE
+    ode_config = load_ode_config(target, condition)
     
     # ODEProjector is defined locally in pipeline.py, so we must redefine it here matching that structure
     class ODEProjector(nn.Module):
-        def __init__(self, ode, latent_dim):
+        def __init__(self, ode, latent_dim, decoder_hidden, decoder_dropout):
             super().__init__()
             self.ode = ode
             # MLP Decoder instead of linear for better mapping
             self.proj = nn.Sequential(
-                nn.Linear(latent_dim, 64),
+                nn.Linear(latent_dim, decoder_hidden),
                 nn.Tanh(),
-                nn.Dropout(p=0.2), # Decoder Regularization
-                nn.Linear(64, 1)
+                nn.Dropout(p=decoder_dropout), # Decoder Regularization
+                nn.Linear(decoder_hidden, 1)
             )
         def forward(self, x, t, mask):
             # ODERNN returns [B, T, latent]
             h = self.ode.ode_net(x, t, mask) 
-            return self.proj(h) # pipeline.py uses .squeeze(-1) but here we handle shape carefully
+            return self.proj(h).squeeze(-1)
 
     input_dim = len(feature_cols)
-    hidden_dim = 64 # Updated to match training config
-    ode_core = GrowthODE(input_dim=input_dim, hidden_dim=hidden_dim).to(DEVICE)
-    model = ODEProjector(ode_core, hidden_dim).to(DEVICE)
+    latent_dim = ode_config["latent_dim"]
+    ode_hidden_dim = ode_config["ode_hidden_dim"]
+    ode_core = GrowthODE(input_dim=input_dim, latent_dim=latent_dim, ode_hidden_dim=ode_hidden_dim).to(DEVICE)
+    model = ODEProjector(
+        ode_core,
+        latent_dim,
+        ode_config["decoder_hidden"],
+        ode_config["decoder_dropout"],
+    ).to(DEVICE)
     
     model_path = f"weights/ode_{target}_{condition}.pth"
     if not os.path.exists(model_path):
