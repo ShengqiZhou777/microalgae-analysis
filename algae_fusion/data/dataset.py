@@ -140,11 +140,16 @@ class AlgaeTimeSeriesDataset(Dataset):
         # Y: Targets [L, 1]
         y = group[self.target_col].values.astype(np.float32)
         
+        # Condition (Assume consistent within group)
+        cond_str = group['condition'].iloc[0]
+        cond_label = 1.0 if cond_str == 'Light' else 0.0
+        
         return {
             'times': torch.tensor(t),
             'features': torch.tensor(x),
             'targets': torch.tensor(y),
-            'mask': torch.ones(len(t)) # All present
+            'mask': torch.ones(len(t)), # All present
+            'condition': torch.tensor(cond_label) # 1=Light, 0=Dark
         }
 
 def collate_ode_batch(batch):
@@ -162,6 +167,7 @@ def collate_ode_batch(batch):
     padded_y = []
     padded_t = []
     padded_mask = []
+    conditions = []
     
     for item in batch:
         l = len(item['times'])
@@ -186,9 +192,12 @@ def collate_ode_batch(batch):
         pm[:l] = 1
         padded_mask.append(pm)
         
+        conditions.append(item['condition'])
+        
     return {
         'features': torch.stack(padded_x), # [B, T, D]
         'targets': torch.stack(padded_y),  # [B, T]
         'times': torch.stack(padded_t),    # [B, T]
-        'mask': torch.stack(padded_mask)   # [B, T]
+        'mask': torch.stack(padded_mask),   # [B, T]
+        'conditions': torch.stack(conditions) # [B]
     }
