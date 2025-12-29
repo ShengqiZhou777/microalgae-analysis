@@ -1,77 +1,61 @@
 import os
+import random
+import json
+import joblib
+from time import time
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.model_selection import KFold, GroupKFold, LeaveOneOut, GroupShuffleSplit
+from algae_fusion.config import DEVICE, BATCH_SIZE, WINDOW_SIZE, RANDOM_SEED
+# from torchvision.transforms import transforms # Removed as logic moved to transforms.py
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler, PowerTransformer
-from torch.utils.data import DataLoader
-from torchvision import transforms
-import joblib
-import json
-from time import time
-from algae_fusion.config import *
-from algae_fusion.data.dataset import MaskedImageDataset
-from algae_fusion.models.cnn import ResNetRegressor
-from algae_fusion.models.tabular import XGBoostExpert, LightGBMExpert
+
+# from algae_fusion.data.dataset import MaskedImageDataset # Removed
+# from algae_fusion.models.cnn import ResNetRegressor # Moved to image_engine
+# from algae_fusion.models.tabular import XGBoostExpert, LightGBMExpert # Moved to tabular_engine
 from algae_fusion.models.moe import GatingNetwork
 from algae_fusion.models.ode import GrowthODE, NeuralODEParameterizer
-from algae_fusion.features.sliding_window import compute_sliding_window_features
 from algae_fusion.features.sliding_window_stochastic import compute_sliding_window_features_stochastic
-from algae_fusion.engine.trainer import train_epoch, eval_epoch
+from algae_fusion.engine.trainer import train_epoch, eval_epoch # Still used? Check usages.
 
-
-from algae_fusion import omics_loader
-
-class Log1pScaler:
-    def __init__(self, s): self.s = s
-    def transform(self, y): return self.s.transform(np.log1p(y).reshape(-1, 1)).flatten()
-    def inverse_transform(self, yp): return np.expm1(self.s.inverse_transform(yp.reshape(-1, 1)).flatten())
-
-class StandardWrapper:
-    def __init__(self, s): self.s = s
-    def transform(self, y): return self.s.transform(y.reshape(-1, 1)).flatten()
-    def inverse_transform(self, yp): return self.s.inverse_transform(yp.reshape(-1, 1)).flatten()
-
-import random
-def set_seed(seed=3407):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    print(f"  [Info] Random Seed set to {seed}")
+from algae_fusion.utils.model_utils import set_seed, Log1pScaler, StandardWrapper, save_pipeline_models
+from algae_fusion.data.processing import (
+    get_all_features, prepare_modeling_data, load_and_split_data, get_morph_features
+)
+from algae_fusion.data.transforms import get_transforms
+from algae_fusion.engine.tabular_engine import run_boost_training, run_ode_training
+from algae_fusion.engine.image_engine import run_image_training
 
 
 
-
-def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stochastic_window=False, condition=None, window_size=None, population_mean=False):
+def run_pipeline(target_name="Dry_Weight", mode="full", stochastic_window=False, condition=None, window_size=None, population_mean=False, ode_window_size=None):
     """
     Orchestrate the full training pipeline.
-    
     Args:
         target_name: The regression target column.
         mode: "full" (all features), "cnn_only", or "boost_only".
-    Args:
-        target_name: The regression target column.
-        mode: "full" (all features), "cnn_only", or "boost_only".
-        hidden_times: List of timepoints to exclude from training (LOO CV).
         stochastic_window: If True, uses randomized history matching.
         condition: If None, train on both. If "Light" or "Dark", train specific.
-        window_size: Sliding window size (history length). Defaults to config value.
+        window_size: Sliding window size (history length) for CNN/Tabular. Defaults to config value.
+        ode_window_size: Sliding window size for ODE mode (if set, cuts trajectories).
     """
+
+    # [MODE SWITCH for ODE]
+    # If mode is ODE, we delegate strictly to the ODE Engine and return.
+    # We do duplication of data loading for now to decouple, OR we load data here and pass it.
+    # To keep pipeline clean, let's load data here and pass it.
     # [CONFIG] Window Size for History
     if window_size is None:
         window_size = WINDOW_SIZE
     
     # Set seed for reproducibility
-    set_seed(42)
+    set_seed(RANDOM_SEED)
     
     # Window=3 means we look back at t-3, t-2, t-1 (plus current t)
     # Total Channels = (3+1) * 3 = 12
@@ -79,98 +63,20 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     
     in_channels = (window_size + 1) * 3 if stochastic_window else 3
     print(f"\n\n{'='*40}")
-    status = "DYNAMIC (History)" if stochastic_window else "STATIC (No History)"
+    status = "DYNAMIC" if stochastic_window else "STATIC"
     print(f"STARTING PIPELINE: Target={target_name}, Mode={mode} | {status} (Win={window_size}, Ch={in_channels})")
     print(f"{'='*40}\n")
 
-    # --- [SIMPLIFIED DATA LOADING] ---
-    # As requested, we rely on 'dataset_train.csv', 'dataset_val.csv' and 'dataset_test.csv' 
-    # generated by scripts/create_balanced_dataset.py.
+    # --- [DATA LOADING] ---
+    df_train, df_val, df_test = load_and_split_data(condition=condition)
+    print(f"  [Split] Loaded Train: {len(df_train)} | Val: {len(df_val)} | Test: {len(df_test)}")
     
-    path_train = "data/dataset_train.csv"
-    path_val = "data/dataset_val.csv"
-    path_test = "data/dataset_test.csv"
+    # Identify morphological columns (needed for history generation)
+    morph_cols = get_morph_features(df_train)
     
-    if not os.path.exists(path_train):
-        raise FileNotFoundError(f"Dataset not found: {path_train}. Please run 'scripts/create_balanced_dataset.py' first.")
-        
-    print(f"  [Data] Loading {path_train}, {path_val}, {path_test}...")
-    train_df = pd.read_csv(path_train)
-    val_df = pd.read_csv(path_val) if os.path.exists(path_val) else pd.DataFrame()
-    test_df = pd.read_csv(path_test) if os.path.exists(path_test) else pd.DataFrame()
-    
-    # Merge for unified processing
-    df = pd.concat([train_df, val_df, test_df], ignore_index=True)
-    
-    # --- [FILTER CONDITION] ---
-    if condition is not None and condition != "All":
-        print(f"  [Filter] Selecting only '{condition}' samples...")
-        df = df[df['condition'] == condition].reset_index(drop=True)
-        
-    # Sort for safety (though create_balanced_dataset usually sorts)
-    df = df.sort_values(by=['condition', 'time'], kind='stable').reset_index(drop=True)
-    
-    # --- [INTERNAL SPLIT LOGIC REMOVED] ---
-    # We now trust the 'split_set' column ('TRAIN', 'VAL', 'TEST') directly from files.
-    
-    # Check if 'group_idx' exists (Critical for ODE)
-    if 'group_idx' not in df.columns:
-        print("  [Warning] 'group_idx' missing. Generating freshly (May break validation consistency)...")
-        df['group_idx'] = df.groupby(['condition', 'time']).cumcount()
-    
-    df_hidden = pd.DataFrame()
-    if hidden_times:
-        mask = df['time'].isin(hidden_times)
-        df_hidden = df[mask].copy().reset_index(drop=True)
-        df = df[~mask].copy().reset_index(drop=True)
-
-    df['Source_Path'] = df['Source_Path'].astype(str)
-    
-    # --- [DYNAMIC FEATURE SELECTION] ---
-    # Automatically identify all morphological columns (starting with cell_)
-    all_numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    morph_cols = [c for c in all_numeric_cols if c.startswith('cell_') and c not in NON_FEATURE_COLS]
-    print(f"  [Info] Identified {len(morph_cols)} morphological features.")
-
     # --- [TRANSFORMS] ---
-    train_transform = transforms.Compose([
-        transforms.Resize(IMG_SIZE),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomVerticalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    ])
-
-    val_transform = transforms.Compose([
-        transforms.Resize(IMG_SIZE),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    ])
-
-    # [SPLIT STRATEGY]
-    # We have:
-    # 1. df_test (Independent Test, split_set='TEST')
-    # 2. df_pool (Training + Validation candidate pool, split_set='TRAIN' or 'VAL')
-    
-    # --- SINGLE PASS TRAINING SETUP ---
-    # --- SINGLE PASS TRAINING SETUP ---
-    train_pool_mask = df['split_set'].isin(['TRAIN', 'VAL'])
-    df_pool = df[train_pool_mask].reset_index(drop=True)
-    df_test = df[df['split_set'] == 'TEST'].reset_index(drop=True) # Defined properly now
-    
-    # [FILTER] Redundant block removed. Filtering handled at lines 104-106.
-
-    # Define Morph Cols for History (used later if stochastic)
-    feature_cols = [c for c in df.columns if c not in NON_FEATURE_COLS and "Prev" not in c]
-    # [FIX] Use ALL features for history generation, not just a subset
-    morph_cols = feature_cols
-    
-    print(f"  [Split] Development Pool Size: {len(df_pool)}")
-    
-    # Prepare df_train (alias for pool to be compatible with loops)
-    df_train = df_pool.copy() 
+    train_transform = get_transforms(split='train')
+    val_transform = get_transforms(split='val')
     
     # helper for stochastic history
     def apply_history(df_in):
@@ -178,452 +84,89 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
              return compute_sliding_window_features_stochastic(df_in, window_size=window_size, morph_cols=morph_cols)
         return df_in
 
-    # 3. K-Fold CV on Training Set (SKIP for ODE mode to preserve sequences)
-    # For ODE, we use the ID-based split_set directly without K-Fold
-    # [User Request] Skip K-Fold for now. Use fixed split for EVERYTHING.
-    # 3. K-Fold CV Logic (Encapsulated/Skipped)
-    # If we wanted to run K-Fold, we would loop here.
-    # formatting: 'def run_kfold(...)'. 
-    # But now we just do Single Split for ALL modes.
     
-    print("  [Split] Using Fixed TRAIN/VAL Split (No K-Fold)...")
-    df_train_fold = df_train[df_train['split_set'] == 'TRAIN'].copy()
-    df_val_fold = df_train[df_train['split_set'] == 'VAL'].copy()
+    # 3. Apply History (if stochastic)
+    df_train = apply_history(df_train)
+    df_val = apply_history(df_val)
+    df_test = apply_history(df_test)
     
-    # Apply History (if stochastic)
-    df_train_fold = apply_history(df_train_fold)
-    df_val_fold = apply_history(df_val_fold)
+    # --- [DATA PREP] ---
+    # Prepare features and adaptive scaling for targets
+    X_tab_train, X_tab_val, y_train_scaled, y_val_scaled, target_scaler, tab_cols = prepare_modeling_data(df_train, df_val, target_name)
     
-    fold = 0 # Dummy fold index
-    
-    # Placeholder for results
-    fold_metrics = []
+    # [FIX] Define original validation targets for gating/metrics
+    y_val_orig = df_val[target_name].values
 
+    # --- [TABULAR ENGINE] ---
+    # Runs Layer 1 (Stacking) and Layer 2 (Prediction) for XGB/LGB
+    tab_results = run_boost_training(X_tab_train, X_tab_val, y_train_scaled, target_scaler, mode=mode)
     
-    tab_cols = [c for c in df_train_fold.columns if c not in NON_FEATURE_COLS]
-    X_tab_train = df_train_fold[tab_cols].select_dtypes(exclude=['object'])
-    X_tab_val = df_val_fold[tab_cols].select_dtypes(exclude=['object'])
-    common_cols = X_tab_train.columns.intersection(X_tab_val.columns)
-    X_tab_train, X_tab_val = X_tab_train[common_cols], X_tab_val[common_cols]
-    
-    y_train_orig, y_val_orig = df_train_fold[target_name].values, df_val_fold[target_name].values
-    
-    # Target Transform (Simplified logic for modular version)
-    y_train_min, y_train_max = y_train_orig.min(), y_train_orig.max()
-    ratio = y_train_max / (y_train_min + 1e-9) if y_train_min >= 0 else 0
-    
-    pt_fold = None
-    if y_train_min >= 0 and ratio > 10:
-        y_train_transformed = np.log1p(y_train_orig)
-        y_val_transformed = np.log1p(y_val_orig)
-        scaler_target = StandardScaler()
-        y_train_scaled = scaler_target.fit_transform(y_train_transformed.reshape(-1, 1)).flatten()
-        y_val_scaled = scaler_target.transform(y_val_transformed.reshape(-1, 1)).flatten()
-        pt_fold = Log1pScaler(scaler_target)
-    else:
-        scaler_target = StandardScaler()
-        y_train_scaled = scaler_target.fit_transform(y_train_orig.reshape(-1, 1)).flatten()
-        y_val_scaled = scaler_target.transform(y_val_orig.reshape(-1, 1)).flatten()
-        pt_fold = StandardWrapper(scaler_target)
+    val_preds_xgb = tab_results['val_preds_xgb']
+    val_preds_lgb = tab_results['val_preds_lgb']
+    models = tab_results['models']
 
-    # Layer 1: XGB1
-    # Layer 1: XGB1
-    if mode in ["full", "boost_only"]:
-        xgb1 = XGBoostExpert(n_estimators=500, learning_rate=0.05, max_depth=4, tree_method="hist")
-        xgb1.fit(X_tab_train, y_train_scaled)
-        X_train_aug = X_tab_train.copy()
-        X_val_aug = X_tab_val.copy()
-        X_train_aug["XGB1_Feature"] = xgb1.predict(X_tab_train)
-        X_val_aug["XGB1_Feature"] = xgb1.predict(X_tab_val) # Corrected from LGB1_Feature
-    else:
-        # In cnn_only/xgb_only, we still need Aug features for gating if we merge
-        X_train_aug, X_val_aug = X_tab_train, X_tab_val # Initialize if not done by XGB1
-        pass
+    img_results = run_image_training(
+        df_train=df_train,
+        df_val=df_val,
+        target_name=target_name,
+        train_transform=train_transform,
+        val_transform=val_transform,
+        y_train_scaled=y_train_scaled,
+        y_val_scaled=y_val_scaled,
+        target_scaler=target_scaler,
+        mode=mode,
+        window_size=window_size,
+        stochastic_window=stochastic_window
+    )
+    
+    val_preds_cnn = img_results['val_preds_cnn']
+    cnn = img_results['model']
 
 
-
-    # Layer 2: XGB2/LGB2
-    val_preds_xgb = np.zeros(len(df_val_fold))
-    if mode in ["full", "xgb_only", "boost_only"]:
-        xgb2 = XGBoostExpert(n_estimators=800, learning_rate=0.05, max_depth=6, tree_method="hist")
-        xgb2.fit(X_train_aug, y_train_scaled)
-        # Prediction needs inverse transform
-        p_scaled = xgb2.predict(X_val_aug)
-        val_preds_xgb = pt_fold.inverse_transform(p_scaled)
-    
-    val_preds_lgb = np.zeros(len(df_val_fold))
-    if mode in ["full", "lgb_only", "boost_only"]:
-        lgb2 = LightGBMExpert(n_estimators=800, learning_rate=0.05, num_leaves=31)
-        lgb2.fit(X_train_aug, y_train_scaled)
-        p_scaled = lgb2.predict(X_val_aug)
-        val_preds_lgb = pt_fold.inverse_transform(p_scaled)
-
-    # Layer 2: CNN
-    val_preds_cnn = np.zeros(len(df_val_fold))
-    if mode in ["full", "cnn_only"]:
-        in_channels = (window_size + 1) * 3 if stochastic_window else 3
-        train_ds = MaskedImageDataset(df_train_fold, target_name, IMG_SIZE, train_transform, labels=y_train_scaled, in_channels=in_channels)
-        val_ds = MaskedImageDataset(df_val_fold, target_name, IMG_SIZE, val_transform, labels=y_val_scaled, in_channels=in_channels)
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=16, pin_memory=True)
-        
-        cnn = ResNetRegressor(BACKBONE, in_channels=in_channels).to(DEVICE)
-        criterion = nn.HuberLoss()
-        optimizer = optim.Adam(cnn.parameters(), lr=LR, weight_decay=1e-2)
-        
-        best_loss = float('inf')
-        best_state = None
-        patience, no_improve = 5, 0
-        for ep in range(EPOCHS):
-            tr_loss = train_epoch(cnn, train_loader, criterion, optimizer)
-            val_loss, _ = eval_epoch(cnn, val_loader, criterion)
-            print(f"  [Epoch {ep+1}/{EPOCHS}] Train Loss: {tr_loss:.4f} | Val Loss: {val_loss:.4f}")
-            if val_loss < best_loss:
-                best_loss, best_state, no_improve = val_loss, cnn.state_dict(), 0
-            else:
-                no_improve += 1
-                if no_improve >= patience: break
-    # --- Neural ODE Mode ---
     if mode == "ode":
-        from algae_fusion.data.dataset import AlgaeTimeSeriesDataset, collate_ode_batch
+        # We need y_test_scaled as well for ODE
+        # Lazy calc if not available? prepare_modeling_data gave us y_val_scaled.
+        # But prepare_modeling_data doesn't return y_test_scaled.
+        # We can quickly compute it here using target_scaler.
+        run_ode_training(
+            df_train=df_train,
+            df_val=df_val,
+            df_test=df_test,
+            target_name=target_name,
+            condition=condition if condition else "All", # Ensure string for file naming
+            target_scaler=target_scaler,
+            ode_window_size=ode_window_size
+        )
+        return
 
-        def aggregate_population_mean(df_in, split_label):
-            if df_in.empty:
-                return df_in
-            df_out = df_in.copy()
-            df_out['time'] = pd.to_numeric(df_out['time'], errors='coerce')
-            group_cols = ['condition', 'time']
-            numeric_cols = df_out.select_dtypes(include=[np.number]).columns.tolist()
-            grouped = df_out.groupby(group_cols, as_index=False)[numeric_cols].mean()
-            grouped['split_set'] = split_label
-            if 'Source_Path' in df_out.columns:
-                src = df_out.groupby(group_cols)['Source_Path'].first().reset_index()
-                grouped = grouped.merge(src, on=group_cols, how='left')
-            if 'file' in df_out.columns:
-                grouped['file'] = grouped.apply(
-                    lambda row: f"{row['condition']}_{row['time']}_mean",
-                    axis=1
-                )
-            return grouped
-        
-        # Optionally collapse to population means per time/condition
-        if population_mean:
-            df_train_fold = aggregate_population_mean(df_train_fold, "TRAIN")
-            df_val_fold = aggregate_population_mean(df_val_fold, "VAL")
-            df_test = aggregate_population_mean(df_test, "TEST")
-
-        # Use numerical tabular columns as input features
-        # Filter out metadata
-        feature_cols = [c for c in df_train_fold.columns if c not in NON_FEATURE_COLS + [target_name]]
-        
-        # [CRITICAL UPDATE] Scale Targets for ODE
-        # The XGBoost logic uses y_train_scaled variable, but ODE Dataset reads from DF.
-        # So we must overwrite the DF target column with scaled values.
-        # Note: We use the already-fitted 'pt_fold' scaler (fitted on training data).
-        
-        print(f"  [ODE] Scaling targets using {type(pt_fold).__name__}...")
-        df_train_fold[target_name] = pt_fold.transform(df_train_fold[target_name].values)
-        df_val_fold[target_name] = pt_fold.transform(df_val_fold[target_name].values)
-        # Scale test set too for validation coherence
-        df_test[target_name] = pt_fold.transform(df_test[target_name].values)
-
-        # Datasets (using fold splits which are already grouped by file)
-        # CHECK: Use 'group_idx' if available, otherwise 'file' might be unique images
-        # The dataframe uses 'group_idx' for biological replicates (generated in load_and_preprocess_data)
-        if population_mean:
-            group_col = 'condition'
-        else:
-            group_col = 'group_idx' if 'group_idx' in df_train_fold.columns else 'file'
-        
-        train_ds = AlgaeTimeSeriesDataset(df_train_fold, feature_cols, target_name, group_col=group_col)
-        val_ds = AlgaeTimeSeriesDataset(df_val_fold, feature_cols, target_name, group_col=group_col)
-
-        seq_lengths = [len(g) for g in train_ds.groups]
-        avg_seq_len = float(np.mean(seq_lengths)) if seq_lengths else 0.0
-        num_sequences = len(train_ds)
-        if population_mean:
-            print("  [ODE] Population-mean mode reduces to one sequence per condition.")
-            print(f"  [ODE] Training sequences: {num_sequences} | Avg length: {avg_seq_len:.2f}")
-        small_data = population_mean and (num_sequences <= 2 or avg_seq_len <= 10)
-        
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_ode_batch)
-        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_ode_batch)
-        
-        print(f"  [ODE] Training on {len(train_ds)} sequences, Validating on {len(val_ds)} sequences")
-        
-        # Initialize Neural ODE-RNN
-        input_dim = len(feature_cols)
-        if small_data:
-            print("  [ODE Warning] Very few time points detected; using a smaller ODE to reduce overfitting.")
-            latent_dim = 8
-            ode_hidden_dim = 32
-            decoder_hidden = 16
-            decoder_dropout = 0.0
-            epochs = 150
-            early_stop_patience = 30
-            lr = 5e-4
-            use_future_masking = False
-        else:
-            latent_dim = 64 # Increased from 32 for even better capacity (Complex Dynamics)
-            ode_hidden_dim = 128
-            decoder_hidden = 64
-            decoder_dropout = 0.2
-            epochs = 300
-            early_stop_patience = 100
-            lr = 1e-4
-            use_future_masking = True
-        # For target prediction, we map latent -> target (scalar)
-        # We need a small decoder on top of ODE output if latent != 1
-        
-        ode_model = GrowthODE(input_dim=input_dim, latent_dim=latent_dim, ode_hidden_dim=ode_hidden_dim).to(DEVICE)
-        # Wrapper to project latent to target
-        class ODEProjector(nn.Module):
-            def __init__(self, ode, latent_dim):
-                super().__init__()
-                self.ode = ode
-                # MLP Decoder instead of linear for better mapping
-                self.proj = nn.Sequential(
-                    nn.Linear(latent_dim, decoder_hidden),
-                    nn.Tanh(),
-                    nn.Dropout(p=decoder_dropout), # Decoder Regularization
-                    nn.Linear(decoder_hidden, 1)
-                )
-            def forward(self, x, t, mask):
-                # ODERNN returns [B, T, latent]
-                h = self.ode.ode_net(x, t, mask) 
-                return self.proj(h).squeeze(-1) # [B, T]
-
-        model = ODEProjector(ode_model, latent_dim).to(DEVICE)
-        
-        optimizer = optim.Adam(model.parameters(), lr=lr) # Lowered LR even further for stability
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20) # Increased patience
-        criterion = nn.MSELoss(reduction='none') 
-        
-        best_loss = float('inf')
-        best_model_state = None
-        patience_counter = 0
-        print(f"  [ODE] Starting Training for {epochs} epochs...")
-
-        time_scale = pd.to_numeric(df_train_fold['time'], errors='coerce').max()
-        time_scale = float(time_scale) if pd.notna(time_scale) and time_scale > 0 else 1.0
-
-        for ep in range(epochs):
-            model.train()
-            ep_loss = 0
-            count = 0
-            for batch in train_loader:
-                x = batch['features'].to(DEVICE)
-                y = batch['targets'].to(DEVICE)
-                t_grid = batch['times'][0].to(DEVICE) / time_scale
-                loss_mask = batch['mask'].to(DEVICE)
-                input_mask = loss_mask.clone()
-                
-                # === [Forecasting Upgrade] Randomized Scheduled Sampling ===
-                # 60% chance to mask future data (Reduced from 80% to stabilize convergence)
-                if use_future_masking and np.random.rand() > 0.4:
-                    seq_len = x.shape[1]
-                    # Choose a random cutoff point (must have at least 1 input)
-                    if seq_len > 2:
-                        cut_idx = np.random.randint(1, seq_len - 1)
-                        input_mask[:, cut_idx:] = 0
-                
-                optimizer.zero_grad()
-                pred = model(x, t_grid, input_mask)
-                
-                # Loss is calculated against ALL valid targets (using loss_mask)
-                # Even the ones we hid from input!
-                loss = (criterion(pred, y) * loss_mask).sum() / loss_mask.sum()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Clip gradients
-                optimizer.step()
-                ep_loss += loss.item()
-                count += 1
-                
-            # Val
-            model.eval()
-            val_loss = 0
-            val_count = 0
-            with torch.no_grad():
-                for batch in val_loader:
-                    x = batch['features'].to(DEVICE)
-                    y = batch['targets'].to(DEVICE)
-                    t_grid = batch['times'][0].to(DEVICE) / time_scale
-                    mask = batch['mask'].to(DEVICE)
-                    pred = model(x, t_grid, mask)
-                    loss = (criterion(pred, y) * mask).sum() / mask.sum()
-                    val_loss += loss.item()
-                    val_count += 1
-            
-            avg_val = val_loss / max(1, val_count)
-            scheduler.step(avg_val)
-            
-            if ep % 5 == 0 or ep == epochs - 1:
-                print(f"  [ODE Epoch {ep}] Train: {ep_loss/max(1, count):.4f} | Val: {avg_val:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
-            
-            if avg_val < best_loss:
-                best_loss = avg_val
-                best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= early_stop_patience:
-                    print(f"  [ODE] Early stopping at epoch {ep}")
-                    break
-        
-        if best_model_state is not None:
-            model.load_state_dict(best_model_state)
-        
-        
-        print("  [ODE] Training Finished.")
-        
-        # === Visualization: Population-level Growth Curve ===
-        import matplotlib.pyplot as plt
-        
-        # Create test dataset
-        test_ds = AlgaeTimeSeriesDataset(df_test, feature_cols, target_name, group_col=group_col)
-        test_loader = DataLoader(test_ds, batch_size=len(test_ds), shuffle=False, collate_fn=collate_ode_batch)
-        
-        model.eval()
-        with torch.no_grad():
-            batch = next(iter(test_loader))
-            x = batch['features'].to(DEVICE)
-            y_true_all = batch['targets'].cpu().numpy()
-            t_grid = batch['times'][0].to(DEVICE) / time_scale
-            mask = batch['mask'].to(DEVICE)
-            
-            # Predict for ALL samples
-            y_pred_all = model(x, t_grid, mask).cpu().numpy() # [N, T]
-            times = batch['times'][0].numpy() # Use first sample's time grid (assumed uniform)
-            mask_np = mask.cpu().numpy()
-            
-            # Since all samples in one jar should have same true value, we just take the mean
-            # (In case there's slight variation in dataset rows, mean is safer)
-            y_true_pop = np.nanmean(np.where(mask_np, y_true_all, np.nan), axis=0)
-            
-            # Calculate mean and std of predictions across the 160 images
-            y_pred_mean = np.nanmean(np.where(mask_np, y_pred_all, np.nan), axis=0)
-            y_pred_std = np.nanstd(np.where(mask_np, y_pred_all, np.nan), axis=0)
-            
-            plt.figure(figsize=(10, 6))
-            # Plot the 'Ground Truth' (Jar level)
-            plt.plot(times, y_true_pop, 'o-', color='blue', label='Ground Truth (Jar Mean)', linewidth=3)
-            
-            # Plot the 'Population Prediction' (Averaged over images)
-            plt.plot(times, y_pred_mean, 's--', color='red', label='ODE Prediction (Population Mean)', linewidth=2)
-            plt.fill_between(times, y_pred_mean - y_pred_std, y_pred_mean + y_pred_std, color='red', alpha=0.2, label='Prediction Std Dev')
-            
-            plt.xlabel('Time (h)', fontsize=14)
-            plt.ylabel(f'{target_name} (scaled)', fontsize=14)
-            plt.title(f'Neural ODE Growth Trajectory: {condition} ({target_name})', fontsize=16)
-            plt.legend(fontsize=12)
-            plt.grid(True, alpha=0.3)
-            
-            # Save figure
-            os.makedirs('results/ode_plots', exist_ok=True)
-            save_path = f'results/ode_plots/{target_name}_{condition}_population_trajectory.png'
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"  [ODE] Population Visualization saved to {save_path}")
-            
-            # Also plot some individuals for context
-            plt.figure(figsize=(10, 6))
-            num_indiv = min(10, len(y_pred_all))
-            for i in range(num_indiv):
-                plt.plot(times, y_pred_all[i], alpha=0.3, color='grey', label='Individual Img Seq' if i==0 else "")
-            plt.plot(times, y_true_pop, 'o-', color='blue', label='Ground Truth', linewidth=3)
-            plt.plot(times, y_pred_mean, 's--', color='red', label='Mean Prediction', linewidth=2)
-            plt.legend()
-            plt.title("Growth Trajectory (Individuals vs Mean)")
-            plt.savefig(save_path.replace('.png', '_individuals.png'), dpi=150)
-            plt.close('all')
-
-            # === New Scatter Plot (Test Set) ===
-            # Flatten arrays and apply mask to get only valid observations
-            mask_flat = mask_np.flatten()
-            y_true_flat = y_true_all.flatten()[mask_flat > 0]
-            y_pred_flat = y_pred_all.flatten()[mask_flat > 0]
-            
-            if len(y_true_flat) > 0:
-                plt.figure(figsize=(9, 9))
-                # Scatter plot
-                plt.scatter(y_true_flat, y_pred_flat, alpha=0.5, color='blue', edgecolor='k', label='Test Samples')
-                
-                # Diagonal line
-                min_val = min(y_true_flat.min(), y_pred_flat.min())
-                max_val = max(y_true_flat.max(), y_pred_flat.max())
-                plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.7, linewidth=2, label='Ideal')
-                
-                # R2 Score
-                from sklearn.metrics import r2_score
-                ode_r2 = r2_score(y_true_flat, y_pred_flat)
-                
-                plt.xlabel(f'True {target_name}', fontsize=12)
-                plt.ylabel(f'Predicted {target_name}', fontsize=12)
-                plt.title(f'ODE Test Set Accuracy: {condition} (R2={ode_r2:.4f})', fontsize=14)
-                plt.legend()
-                plt.grid(True, alpha=0.3, linestyle='--')
-                
-                scatter_path = f'results/ode_plots/{target_name}_{condition}_test_scatter.png'
-                plt.savefig(scatter_path, dpi=150, bbox_inches='tight')
-                print(f"  [ODE] Test Scatter Plot saved to {scatter_path}")
-                plt.close('all')
-
-        # [FIX] Save model and scaler before returning
-        os.makedirs("weights", exist_ok=True)
-        model_prefix = f"weights/ode_{target_name}_{condition}"
-        torch.save(model.state_dict(), f"{model_prefix}.pth")
-        ode_config = {
-            "latent_dim": latent_dim,
-            "ode_hidden_dim": ode_hidden_dim,
-            "decoder_hidden": decoder_hidden,
-            "decoder_dropout": decoder_dropout,
-            "population_mean": population_mean,
-            "num_sequences": num_sequences,
-            "avg_sequence_length": avg_seq_len,
-        }
-        with open(f"{model_prefix}_config.json", "w") as config_file:
-            json.dump(ode_config, config_file, indent=2)
-        if pt_fold:
-             joblib.dump(pt_fold, f"{model_prefix}_scaler.joblib")
-        print(f"  [SUCCESS] ODE Model saved to {model_prefix}.pth")
-
-        return 
-
-    # Hidden Set Prediction (Restored)
-    if not df_hidden.empty:
-        folds_run += 1
-        X_tab_hidden = df_hidden[tab_cols].select_dtypes(exclude=['object'])
-        for c in common_cols:
-            if c not in X_tab_hidden.columns: X_tab_hidden[c] = 0
-        X_tab_hidden = X_tab_hidden[common_cols]
-        
-        if mode in ["full", "boost_only"]:
-            X_hidden_aug = X_tab_hidden.copy()
-            X_hidden_aug["XGB1_Feature"] = xgb1.predict(X_tab_hidden)
-        else:
-            X_hidden_aug = X_tab_hidden
-            
-            p = xgb2.predict(X_hidden_aug)
-            hidden_accum_xgb += pt_fold.inverse_transform(p)
-        if mode in ["full", "lgb_only", "boost_only"]:
-            p = lgb2.predict(X_hidden_aug)
-            hidden_accum_lgb += pt_fold.inverse_transform(p)
-        if mode in ["full", "cnn_only"]:
-            h_ds = MaskedImageDataset(df_hidden, target_name, IMG_SIZE, val_transform)
-            h_loader = DataLoader(h_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=16)
-            _, ps = eval_epoch(cnn, h_loader, criterion)
-            hidden_accum_cnn += pt_fold.inverse_transform(ps)
 
     # --- MoE Gating (Train on Validation Set) ---
     # We use the predictions on the validation set as inputs to the Gater
     from algae_fusion.engine.moe_engine import train_and_fuse_experts
     from algae_fusion.utils.visualization import visualize_results
 
-    gating_cols = [c for c in df_pool.columns if c not in NON_FEATURE_COLS + [target_name]]
+    gating_cols = get_all_features(df_train)
     
-    # Stack Available Experts
-    # Order: XGB, LGB, CNN
-    expert_preds_list = [val_preds_xgb, val_preds_lgb]
-    expert_preds_list.append(val_preds_cnn)
+    # Stack Available Experts Dynamically
+    # This design allows for any number of experts (Tabular, CNN, ODE, Transformer, etc.)
+    expert_preds_list = []
+    
+    # 1. Tabular Experts
+    if 'val_preds_xgb' in locals() and np.any(val_preds_xgb): 
+        expert_preds_list.append(val_preds_xgb)
+        print("  [MoE] Added Tabular Expert: XGB")
+    if 'val_preds_lgb' in locals() and np.any(val_preds_lgb): 
+        expert_preds_list.append(val_preds_lgb)
+        print("  [MoE] Added Tabular Expert: LGB")
+        
+    # 2. Image Experts
+    if 'val_preds_cnn' in locals() and np.any(val_preds_cnn):
+        expert_preds_list.append(val_preds_cnn)
+        print("  [MoE] Added Image Expert: CNN")
+    
+    if not expert_preds_list:
+        print("  [Warning] No experts available for MoE fusion. Utilizing mean of dummy zeros (Bad state).")
+        expert_preds_list = [np.zeros(len(df_val))]
     
     # [MODEL SAVING PREFIX SETUP]
     os.makedirs("weights", exist_ok=True)
@@ -632,7 +175,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     model_prefix = f"weights/{target_name}_{cond_str}_{suffix}"
     
     final_valid_pred, g_net, gating_scaler = train_and_fuse_experts(
-        df_val=df_val_fold,
+        df_val=df_val,
         target_name=target_name,
         expert_preds_list=expert_preds_list,
         gating_feature_cols=gating_cols,
@@ -645,7 +188,7 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     output_dir = os.path.join("output", target_name, mode, history_str, cond_str)
     os.makedirs(output_dir, exist_ok=True)
     
-    df_val_for_save = df_val_fold.copy()
+    df_val_for_save = df_val.copy()
     df_val_for_save[f"Predicted_{target_name}"] = final_valid_pred
     
     # [OPTIMIZATION] Save individual experts for One-Shot Ablation Study
@@ -675,33 +218,23 @@ def run_pipeline(target_name="Dry_Weight", mode="full", hidden_times=None, stoch
     visualize_results(result_csv, target_name, output_dir)
     
     # --- MODEL SAVING (Experts) ---
-    # Gating/Scaler already saved by train_and_fuse_experts if prefix provided
+    from algae_fusion.utils.model_utils import save_pipeline_models
     
-    # 1. Save Tabular Models
-    if mode in ["full", "boost_only"]:
-        xgb1.save(f"{model_prefix}_xgb1.json")
-        xgb2.save(f"{model_prefix}_xgb2.json")
-    if mode in ["full", "lgb_only", "boost_only"]:
-        lgb2.save(f"{model_prefix}_lgb.joblib")
-    
-    if mode in ["full", "cnn_only"]:
-        torch.save(cnn.state_dict(), f"{model_prefix}_cnn.pth")
-        
-    # 2. Save Target Scaler
-    if pt_fold:
-        joblib.dump(pt_fold, f"{model_prefix}_target_scaler.joblib")
-    
-    # 3. Save Metadata (Features used)
-    # Use columns from train fold (should be same as val)
     metadata = {
         'target_name': target_name,
-        'feature_cols': [c for c in X_tab_train.columns.tolist() if c not in ['split_set']],
-        'gating_cols': [c for c in gating_cols if c not in ['split_set']],
+        'feature_cols': get_all_features(df_train),
+        'gating_cols': gating_cols,
         'stochastic': stochastic_window,
         'window_size': window_size,
         'mode': mode
     }
-    with open(f"{model_prefix}_metadata.json", "w") as f:
-        json.dump(metadata, f)
     
-    print(f"  [SUCCESS] All models saved to: {model_prefix}_*")
+    save_pipeline_models(
+        mode=mode,
+        model_prefix=model_prefix,
+        xgb=models.get('xgb'),
+        lgb=models.get('lgb'),
+        cnn=cnn if 'cnn' in locals() else None,
+        target_scaler=target_scaler,
+        metadata=metadata
+    )

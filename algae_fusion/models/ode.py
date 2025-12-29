@@ -171,3 +171,31 @@ class GrowthODE(nn.Module):
             mask: [B, T] Mask
         """
         return self.ode_net(x, t, mask)
+
+class ODEProjector(nn.Module):
+    """
+    Projector head for ODE-RNN.
+    Maps latent state -> Output (Scalar Target).
+    """
+    def __init__(self, ode_model, latent_dim, hidden_dim=64):
+        super().__init__()
+        self.ode_model = ode_model
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1) # Regress scalar target
+        )
+        
+    def forward(self, x, t, mask=None):
+        # 1. Get Latent Sequence [B, T, Latent]
+        latent_seq = self.ode_model(x, t, mask)
+        
+        # 2. Decode each time step independently
+        # [B, T, Latent] -> [B*T, Latent]
+        b, t_steps, d = latent_seq.shape
+        flat = latent_seq.view(-1, d)
+        
+        out = self.decoder(flat) # [B*T, 1]
+        
+        return out.view(b, t_steps) # [B, T]

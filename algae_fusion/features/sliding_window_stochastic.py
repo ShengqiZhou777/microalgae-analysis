@@ -10,9 +10,13 @@ def compute_sliding_window_features_stochastic(df, window_size=3, morph_cols=Non
     if morph_cols is None:
         return df
 
-    # Sort within each group to ensure 'sequential' picking
-    df = df.sort_values(['time', 'condition', 'file']).reset_index(drop=True)
-    df['group_idx'] = df.groupby(['time', 'condition']).cumcount()
+    # [FIX] Do NOT regenerate group_idx here. Rely on the one provided by pipeline.py
+    # or ensure it exists. If it doesn't exist, we error out as it's critical.
+    if 'group_idx' not in df.columns:
+        raise KeyError("Column 'group_idx' is required for stochastic sliding window features. Please ensure it is generated in the pipeline.")
+    
+    # Sort for safety but do NOT reset group_idx
+    df = df.sort_values(['time', 'condition', 'group_idx']).reset_index(drop=True)
     
     all_times = sorted(df['time'].unique())
     time_idx_map = {t: i for i, t in enumerate(all_times)}

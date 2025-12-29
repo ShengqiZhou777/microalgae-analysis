@@ -23,8 +23,6 @@ class MaskedImageDataset(Dataset):
     def _load_and_mask_image(self, source_path, file_name):
         """Helper to load and mask a single image."""
         base = file_name.replace("_mask.png", "").replace(".png", "")
-        base = file_name.replace("_mask.png", "").replace(".png", "")
-        # source_path contains the specific subdirectory (e.g. TIMECOURSE/0h/images)
         # We need to respect that structure.
         image_dir = os.path.join(PATH_PREFIX, source_path)
         # Assuming masks are in a sibling folder named 'masks' relative to 'images'
@@ -54,7 +52,6 @@ class MaskedImageDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         
-        all_tensors = []
         all_tensors = []
         # Dynamic History Logic
         # Total Channels = (History + Current) * 3
@@ -100,57 +97,112 @@ class MaskedImageDataset(Dataset):
         label = torch.tensor(label_val, dtype=torch.float32)
         return stacked_tensor, label
 
-class AlgaeTimeSeriesDataset(Dataset):
+class ODETimeSeriesDataset(Dataset):
     """
-    Dataset for Neural ODE / ODE-RNN.
-    Groups data by biological replicate ('file') to form time series.
-    Returns (times, features, mask, target_sequence)
+    Unified Dataset for Neural ODE / ODE-RNN.
+    Supports two modes:
+    1. mode='trajectory' (default): Returns full biological sequences (0h -> 24h).
+    2. mode='window': Chunks sequences into sliding windows for step-wise forecasting.
     """
-    def __init__(self, df, feature_cols, target_col, time_col='time', group_col='file'):
-        self.df = df.sort_values([group_col, time_col]).reset_index(drop=True)
+    def __init__(self, df, feature_cols, target, time_col='time', group_col='file', mode='trajectory', window_size=3):
+        # Allow target to be a column name (str) or an array (np.ndarray/pd.Series)
+        self.target_is_array = not isinstance(target, str)
+        local_df = df.copy()
+        
+        if self.target_is_array:
+             # Inject the external target array into the dataframe for consistent sorting/grouping
+             target_col_name = "_internal_target"
+             local_df[target_col_name] = target
+             self.target_col = target_col_name
+        else:
+             self.target_col = target
+             
+        self.df = local_df.sort_values([group_col, time_col]).reset_index(drop=True)
         self.feature_cols = feature_cols
-        self.target_col = target_col
         self.time_col = time_col
         self.group_col = group_col
+        self.mode = mode
+        self.window_size = window_size
         
-        # Group data
-        self.groups = [g for _, g in self.df.groupby(group_col)]
+        self.samples = []
         
-        # [DEBUG] Verification
-        if len(self.groups) > 0:
-            avg_len = np.mean([len(g) for g in self.groups])
-            print(f"  [Dataset] Formed {len(self.groups)} sequences (Avg Length: {avg_len:.2f})")
-            # Print sample of first group
-            first_group = self.groups[0]
-            print(f"  [Sample 0] Times: {first_group[time_col].values}")
+        # 1. Group by biological replicate
+        grouped = self.df.groupby(group_col)
         
+        for _, group in grouped:
+            times = group[self.time_col].values.astype(np.float32)
+            feats = group[self.feature_cols].values.astype(np.float32)
+            targets = group[self.target_col].values.astype(np.float32)
+            
+            # Condition (Assume consistent within group)
+            cond_str = group['condition'].iloc[0] if 'condition' in group.columns else 'Unknown'
+            cond_label = 1.0 if cond_str == 'Light' else 0.0
+
+            n = len(times)
+            if n == 0: continue
+
+            if self.mode == 'trajectory':
+                # --- Mode 1: Full Trajectory ---
+                # Simply wrap the whole group as one sample
+                self.samples.append({
+                    'times': torch.tensor(times),
+                    'features': torch.tensor(feats),
+                    'targets': torch.tensor(targets),
+                    'mask': torch.ones(n), # All present
+                    'condition': torch.tensor(cond_label)
+                })
+
+            elif self.mode == 'window':
+                # --- Mode 2: Sliding Window Chunks ---
+                if self.window_size is None:
+                    raise ValueError("window_size must be provided for mode='window'")
+
+                # Safety Check: Group must differ in length to form at least one window? 
+                # Actually, if n <= window_size, we might not have enough history for the strict definition.
+                # Here we loop range(1, n).
+                if n < 2: 
+                    continue # Need at least 2 points to predict something (t=1 from t=0)
+                
+                # We want to predict index 'i' using 'i-window_size' to 'i-1'
+                for i in range(1, n):
+                    # Start index (inclusive)
+                    start_idx = max(0, i - self.window_size)
+                    # End index (inclusive for slicing needs +1)
+                    end_idx = i + 1
+                    
+                    chunk_times = times[start_idx : end_idx]
+                    
+                    # Additional Safety: If chunk is too small?
+                    # Current logic allows short chunks at start (padding implicit by short length).
+                    # But if chunk len = 1, it means we only have target, no history?
+                    # i=1, start=0, end=2 -> [0, 1]. Len=2. Mask=[-1]=0. History=[0]. Target=[1]. OK.
+                    # As long as len > 1, we are good.
+                    if len(chunk_times) < 2:
+                        continue
+
+                    chunk_feats = feats[start_idx : end_idx].copy()
+                    chunk_targets = targets[start_idx : end_idx]
+                    
+                    # Construct Mask: 1 for history AND current target (we want to predict t)
+                    mask = np.ones(len(chunk_times))
+                    # mask[-1] = 0 # OLD: Mask out target. NEW: We want to predict target, so mask=1.
+                    
+                    # Do NOT mask future features (we want to use Features(t) to predict Target(t))
+                    # chunk_feats[-1, :] = 0 
+                    
+                    self.samples.append({
+                        'times': torch.tensor(chunk_times),
+                        'features': torch.tensor(chunk_feats),
+                        'targets': torch.tensor(chunk_targets),
+                        'mask': torch.tensor(mask),
+                        'condition': torch.tensor(cond_label)
+                    })
+                    
     def __len__(self):
-        return len(self.groups)
-    
+        return len(self.samples)
+
     def __getitem__(self, idx):
-        group = self.groups[idx]
-        
-        # Extract sequences
-        # T: Time points
-        t = group[self.time_col].values.astype(np.float32)
-        
-        # X: Features [L, D]
-        x = group[self.feature_cols].values.astype(np.float32)
-        
-        # Y: Targets [L, 1]
-        y = group[self.target_col].values.astype(np.float32)
-        
-        # Condition (Assume consistent within group)
-        cond_str = group['condition'].iloc[0]
-        cond_label = 1.0 if cond_str == 'Light' else 0.0
-        
-        return {
-            'times': torch.tensor(t),
-            'features': torch.tensor(x),
-            'targets': torch.tensor(y),
-            'mask': torch.ones(len(t)), # All present
-            'condition': torch.tensor(cond_label) # 1=Light, 0=Dark
-        }
+        return self.samples[idx]
 
 def collate_ode_batch(batch):
     """
@@ -201,3 +253,6 @@ def collate_ode_batch(batch):
         'mask': torch.stack(padded_mask),   # [B, T]
         'conditions': torch.stack(conditions) # [B]
     }
+
+# Backward compatibility alias
+AlgaeTimeSeriesDataset = ODETimeSeriesDataset

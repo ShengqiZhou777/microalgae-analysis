@@ -8,9 +8,10 @@ PATH_PREFIX = "data/"
 # ================= 训练参数 =================
 IMG_SIZE = (512, 512) 
 BATCH_SIZE = 128
-EPOCHS = 5
+EPOCHS = 15
 LR = 1e-5
-WINDOW_SIZE = 3 # Default Sliding Window Size (History)
+WINDOW_SIZE = 3 
+RANDOM_SEED = 42
 
 # ================= 验证策略 =================
 N_SPLITS = 5

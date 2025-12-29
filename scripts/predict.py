@@ -23,11 +23,10 @@ from algae_fusion.utils.logger import setup_logger
 
 from algae_fusion.config import IMG_SIZE, DEVICE, BACKBONE, NON_FEATURE_COLS, WINDOW_SIZE
 from algae_fusion.models.cnn import ResNetRegressor
-from algae_fusion.models.tabular import XGBoostExpert, LightGBMExpert
+from algae_fusion.models.boost import XGBoostExpert, LightGBMExpert
 from algae_fusion.models.moe import GatingNetwork
 from algae_fusion.data.dataset import MaskedImageDataset
-# from algae_fusion.models.lstm import MorphLSTM # LSTM removed
-# from algae_fusion.engine.pipeline import prepare_lstm_tensor # LSTM removed
+
 
 
 # Define targets and their model file suffixes
@@ -35,7 +34,7 @@ TARGETS = ["Dry_Weight", "Chl_Per_Cell", "Fv_Fm", "Oxygen_Rate"]
 
 def load_moe_ensemble(target, model_prefix):
     """
-    Loads XGB1, XGB2, LGB2, CNN, and Gating Network for a specific target.
+    Loads XGB, LGB, CNN, and Gating Network for a specific target.
     Returns a dictionary of loaded artifacts.
     """
     artifacts = {}
@@ -61,26 +60,20 @@ def load_moe_ensemble(target, model_prefix):
     if os.path.exists(gating_scaler_path):
         artifacts['gating_scaler'] = joblib.load(gating_scaler_path)
 
+
     # 1. Load Tabular Experts
-    if os.path.exists(f"{model_prefix}_xgb1.json"):
-        xgb1 = XGBoostExpert()
-        xgb1.load(f"{model_prefix}_xgb1.json")
-        artifacts['xgb1'] = xgb1
-    
-    if os.path.exists(f"{model_prefix}_xgb2.json"):
-        xgb2 = XGBoostExpert() # Note: hyperparams don't matter for loading
-        xgb2.load(f"{model_prefix}_xgb2.json")
-        artifacts['xgb2'] = xgb2
+    if os.path.exists(f"{model_prefix}_xgb.json"):
+        xgb = XGBoostExpert()
+        xgb.load(f"{model_prefix}_xgb.json")
+        artifacts['xgb'] = xgb
     
     lgb_path = f"{model_prefix}_lgb.joblib"
     if os.path.exists(lgb_path):
-        lgb2 = LightGBMExpert()
-        lgb2.load(lgb_path)
-        artifacts['lgb2'] = lgb2
+        lgb = LightGBMExpert()
+        lgb.load(lgb_path)
+        artifacts['lgb'] = lgb
 
-    # 1.5 Load LSTM Expert
-    # [REVERTED] LSTM removed.
-    pass
+
 
 
 
@@ -141,41 +134,23 @@ def predict_single_target(df, target, artifacts):
     # Use reindex to handle missing columns gracefully, then filter for numeric
     X = df.reindex(columns=feature_cols).select_dtypes(include=[np.number]).fillna(0)
     
-    # Check if we have the correct number of columns for XGB/LGB
-    # If the network was trained on 364 features but X has 365, models might complain.
-    # However, XGB/LGB models usually handle column sets appropriately if names match.
-    
-    # Layer 1: XGB1
-    xgb1 = artifacts.get('xgb1')
-    if xgb1:
-        l1_feat = xgb1.predict(X)
-    else:
-        l1_feat = np.zeros(len(df))
-    
-    # Layer 2: Augment
-    X_aug = X.copy()
-    X_aug["XGB1_Feature"] = l1_feat
 
-    # Layer 1.5: LSTM (Augment with Temporal Features)
-    # [REVERTED]
+    # Layer 2 / Experts
+    # Use X (Raw) directly as there is no stacking layer
+    X_input_for_experts = X
     preds_map = {}
 
-    # --- Run Experts ---
-
-
-
-    
-    # 1. XGB2 (Expert 1)
-    xgb2 = artifacts.get('xgb2')
-    if xgb2:
-        preds_map['xgb'] = xgb2.predict(X_aug)
+    # 1. XGB (Expert 1)
+    xgb = artifacts.get('xgb')
+    if xgb:
+        preds_map['xgb'] = xgb.predict(X_input_for_experts)
     else:
         preds_map['xgb'] = np.zeros(len(df))
         
-    # 2. LGB2 (Expert 2)
-    lgb2 = artifacts.get('lgb2')
-    if lgb2:
-        preds_map['lgb'] = lgb2.predict(X_aug)
+    # 2. LGB (Expert 2)
+    lgb = artifacts.get('lgb')
+    if lgb:
+        preds_map['lgb'] = lgb.predict(X_input_for_experts)
     else:
         preds_map['lgb'] = np.zeros(len(df))
 
@@ -252,8 +227,7 @@ def predict_single_target(df, target, artifacts):
         
         # Check which experts are active (artifacts loaded)
         # Order: XGB, LGB, [LSTM], CNN
-        active_mask = [1 if artifacts.get('xgb2') else 0, 1 if artifacts.get('lgb2') else 0]
-        if 'lstm' in artifacts: active_mask.append(1)
+        active_mask = [1 if artifacts.get('xgb') else 0, 1 if artifacts.get('lgb') else 0]
         active_mask.append(1 if artifacts.get('cnn') else 0)
 
         num_experts = len(active_mask)
@@ -268,9 +242,6 @@ def predict_single_target(df, target, artifacts):
         else:
              weights[:, 0] = 1.0 
 
-    # --- Aggregate ---
-    # --- Aggregate ---
-    # --- Aggregate ---
     # Determine stacking based on Gating Weights dimension
     num_expected = weights.shape[1]
     
@@ -279,9 +250,9 @@ def predict_single_target(df, target, artifacts):
     
     # If 4 experts: XGB, LGB, LSTM, CNN
     if num_expected == 4:
-        lstm_p = preds_map.get('lstm', np.zeros(len(df)))
-        stack_list.append(lstm_p)
-        stack_list.append(preds_map['cnn'])
+        # Unexpected case: Fallback to 3 if only CNN added?
+        # Actually logic was for LSTM. Since removed, we shouldn't hit 4.
+        pass
         
     # If 3 experts: XGB, LGB, CNN
     elif num_expected == 3:
@@ -308,7 +279,7 @@ def predict_single_target(df, target, artifacts):
         'lgb': preds_map['lgb'], 
         'cnn': preds_map.get('cnn', np.zeros(len(df)))
     }
-    if 'lstm' in preds_map: expert_raw['lstm'] = preds_map['lstm']
+
 
     
     # --- Inverse Transform ---
@@ -417,8 +388,10 @@ def main():
                 # Store results aligned with index
                 subset_df[f"Pred_{target}_Static"] = p_s
                 subset_df[f"W_XGB_{target}_Static"] = w_s[:, 0]
-                subset_df[f"W_LGB_{target}_Static"] = w_s[:, 1]
-                subset_df[f"W_CNN_{target}_Static"] = w_s[:, 2]
+                if w_s.shape[1] > 1:
+                    subset_df[f"W_LGB_{target}_Static"] = w_s[:, 1]
+                if w_s.shape[1] > 2:
+                    subset_df[f"W_CNN_{target}_Static"] = w_s[:, 2]
                 
                 if exp_s['xgb'] is not None: subset_df[f"Pred_{target}_Static_XGB"] = exp_s['xgb']
                 if exp_s['lgb'] is not None: subset_df[f"Pred_{target}_Static_LGB"] = exp_s['lgb']
@@ -450,9 +423,12 @@ def main():
                         'time': subset_dyn['time'],
                         f"Pred_{target}_Dynamic": p_d,
                         f"W_XGB_{target}_Dynamic": w_d[:, 0],
-                        f"W_LGB_{target}_Dynamic": w_d[:, 1],
-                        f"W_CNN_{target}_Dynamic": w_d[:, 2]
                     })
+                    
+                    if w_d.shape[1] > 1:
+                        res_dyn[f"W_LGB_{target}_Dynamic"] = w_d[:, 1]
+                    if w_d.shape[1] > 2:
+                        res_dyn[f"W_CNN_{target}_Dynamic"] = w_d[:, 2]
                     if exp_d['xgb'] is not None: res_dyn[f"Pred_{target}_Dynamic_XGB"] = exp_d['xgb']
                     if exp_d['lgb'] is not None: res_dyn[f"Pred_{target}_Dynamic_LGB"] = exp_d['lgb']
                     
