@@ -92,3 +92,26 @@ This explains the contradiction you noticed ("CV is high, but R2 is perfect"):
 3.  **The Model's Job**: It doesn't need to predict the size difference between two 48h cells. It just needs to figure out **"You are both 48h cells"** and output the constant label **2.183333**.
 
 The model absorbs the morphological noise and maps the entire cluster to a single point.
+
+## 3. How to Refine and Stress-Test the Model
+
+- **Use harder splits that break the "lookup" shortcut**
+  - Leave-one-timepoint-out or leave-one-batch-out folds so the model cannot memorize a specific morphology→label mapping.
+  - When possible, create domain-shift validation (e.g., unseen lighting or microscope) to check generalization beyond the current clusters.
+- **If leave-one-timepoint already breaks after ~24h, treat it as a diagnosis**
+  - The sharp drop you observed past 24h implies the model is overfitting early-time morphology. Inspect feature importance and per-timepoint error to confirm which cues fail.
+  - Mitigate by mixing early/late examples in every fold, adding scale/brightness augmentation, and enforcing monotonic or stage-aware constraints so late-time predictions cannot collapse.
+- **Increase label diversity within clusters**
+  - If multiple measurements exist per condition/timepoint, keep them separate instead of averaging so the regression task has intra-group variation.
+  - Add continuous covariates (e.g., nutrient level, temperature) to the feature table so the model must predict along gradients, not just classify states.
+- **Reduce morphology-only cues**
+  - Standardize imaging (exposure, magnification) and include augmentation that perturbs scale/brightness so the model focuses on subtle signals.
+  - Consider normalizing features by cell size or per-image statistics to dampen easy clustering signals.
+- **Audit and regularize the tree models**
+  - Limit tree depth / number of leaves and inspect feature importance; if a single feature dominates, reshape features or add noise tests to ensure robustness.
+  - Calibrate predictions on a held-out set to detect overconfident "memorized" leaves.
+- **Add temporal/biological structure**
+  - If timepoints are known, impose monotonic constraints or sequential models so predictions must follow realistic growth trajectories.
+  - For CNN branches, experiment with history stacking or simple 1D temporal models to move from state classification toward dynamics modeling.
+
+These steps turn the task from "identify the state and lookup its mean" into genuine regression on biological signals, giving a more trustworthy R².
